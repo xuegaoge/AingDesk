@@ -9,3 +9,7 @@ package-lock.json
 /data/context
 /data/models
 /sys_data
+/.playwright-mcp/frontend_initial_state.png
+/bin/bun.exe
+/data
+/sys_data/save_path.json
