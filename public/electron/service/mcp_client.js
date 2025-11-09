@@ -346,6 +346,23 @@ class MCPClient {
       return result;
     } catch (error) {
       import_log.logger.error(`Failed to execute tool call for ${toolName}:`, error);
+      if (error.code === -32600 && error.message && error.message.includes("has an output schema but did not return structured content")) {
+        import_log.logger.warn(`MCP tool ${toolName} doesn't return structured content. Creating fallback result.`);
+        return {
+          content: [{
+            type: "text",
+            text: `\u5DE5\u5177 ${toolName} \u6267\u884C\u5B8C\u6210\uFF08\u4F46\u8FD4\u56DE\u683C\u5F0F\u4E0D\u517C\u5BB9MCP\u6807\u51C6\uFF09\u3002\u8BF7\u67E5\u770B\u65E5\u5FD7\u83B7\u53D6\u8BE6\u7EC6\u4FE1\u606F\u3002`
+          }],
+          structuredContent: {
+            error: `Tool ${toolName} compatibility issue`,
+            message: error.message,
+            toolName,
+            toolArgs,
+            note: "This is a fallback result due to MCP format incompatibility"
+          },
+          isError: true
+        };
+      }
       throw error;
     }
   }

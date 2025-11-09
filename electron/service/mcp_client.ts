@@ -369,8 +369,30 @@ export class MCPClient {
                 arguments: toolArgs
             });
             return result as unknown as MCPToolResult;
-        } catch (error) {
+        } catch (error: any) {
             logger.error(`Failed to execute tool call for ${toolName}:`, error);
+
+            // 处理MCP SDK的-32600错误（structuredContent验证失败）
+            if (error.code === -32600 && error.message && error.message.includes("has an output schema but did not return structured content")) {
+                logger.warn(`MCP tool ${toolName} doesn't return structured content. Creating fallback result.`);
+
+                // 返回一个模拟的structuredContent，避免SDK抛出错误，让流程可以继续
+                return {
+                    content: [{
+                        type: "text",
+                        text: `工具 ${toolName} 执行完成（但返回格式不兼容MCP标准）。请查看日志获取详细信息。`
+                    }],
+                    structuredContent: {
+                        error: `Tool ${toolName} compatibility issue`,
+                        message: error.message,
+                        toolName,
+                        toolArgs,
+                        note: "This is a fallback result due to MCP format incompatibility"
+                    },
+                    isError: true
+                } as unknown as MCPToolResult;
+            }
+
             throw error;
         }
     }
