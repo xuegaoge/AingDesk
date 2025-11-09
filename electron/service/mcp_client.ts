@@ -369,7 +369,14 @@ export class MCPClient {
             const ac = (a.column ?? 0), bc = (b.column ?? 0);
             return ac - bc;
         });
+        // 若为矩形区域（如 A1:B10 或 A1:C3），生成最简 Markdown 表格
+        const md = this.tryFormatExcelCellsAsMarkdown(range, cells);
+        if (md) {
+            // 在表格前输出表头信息，便于定位
+            return `${header}\n\n${md}`;
+        }
 
+        // 默认纯文本渲染（按地址逐行显示）
         const lines: string[] = [header];
         for (const c of cells) {
             const addr = (c.address || (typeof c.column === 'number' && typeof c.row === 'number' ? `R${c.row}C${c.column}` : '')).toString();
@@ -377,6 +384,86 @@ export class MCPClient {
             lines.push(`${addr}: ${value}`);
         }
         return lines.join('\n');
+    }
+
+    /**
+     * 尝试将矩形区域的 Excel 单元格渲染为最简 Markdown 表格
+     * 仅在 range 形如 "A1:B10"、"A1:C3" 等矩形时生效
+     */
+    private tryFormatExcelCellsAsMarkdown(range: string, cells: any[]): string | null {
+        const parsed = this.parseExcelRange(range);
+        if (!parsed) return null;
+        const { startCol, endCol, startRow, endRow } = parsed;
+        if (startCol > endCol || startRow > endRow) return null;
+
+        // 将单元格按行/列归档，便于表格输出
+        const grid = new Map<number, Map<number, string>>(); // row -> (col -> value)
+        for (const c of cells) {
+            const r = Number(c.row);
+            const colNum = Number(c.column);
+            if (!Number.isFinite(r) || !Number.isFinite(colNum)) continue;
+            if (r < startRow || r > endRow || colNum < startCol || colNum > endCol) continue;
+            const val = (c.value !== undefined && c.value !== null) ? String(c.value) : '';
+            if (!grid.has(r)) grid.set(r, new Map<number, string>());
+            grid.get(r)!.set(colNum, val);
+        }
+
+        // 构造表头：使用列字母（A/B/C…）
+        const headers: string[] = [];
+        for (let col = startCol; col <= endCol; col++) headers.push(this.indexToColLetter(col));
+
+        const lines: string[] = [];
+        lines.push(`| ${headers.join(' | ')} |`);
+        lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
+        for (let row = startRow; row <= endRow; row++) {
+            const rowMap = grid.get(row) || new Map<number, string>();
+            const rowVals: string[] = [];
+            for (let col = startCol; col <= endCol; col++) {
+                const v = rowMap.get(col) || '';
+                // 简单转义竖线，避免破坏 Markdown 列分隔
+                rowVals.push(v.replace(/\|/g, '\\|'));
+            }
+            lines.push(`| ${rowVals.join(' | ')} |`);
+        }
+        return lines.join('\n');
+    }
+
+    /**
+     * 解析 Excel 区域字符串（如 "A1:B10"）为行列数字
+     */
+    private parseExcelRange(range: string): { startCol: number; endCol: number; startRow: number; endRow: number } | null {
+        const m = range.match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i);
+        if (!m) return null;
+        const startCol = this.colLetterToIndex(m[1].toUpperCase());
+        const startRow = Number(m[2]);
+        const endCol = this.colLetterToIndex(m[3].toUpperCase());
+        const endRow = Number(m[4]);
+        if (!Number.isFinite(startCol) || !Number.isFinite(endCol) || !Number.isFinite(startRow) || !Number.isFinite(endRow)) return null;
+        return { startCol, endCol, startRow, endRow };
+    }
+
+    /**
+     * 列字母转数字（A->1, B->2, ..., Z->26, AA->27 ...）
+     */
+    private colLetterToIndex(s: string): number {
+        let n = 0;
+        for (let i = 0; i < s.length; i++) {
+            n = n * 26 + (s.charCodeAt(i) - 64);
+        }
+        return n;
+    }
+
+    /**
+     * 列数字转字母（1->A, 2->B, ..., 27->AA ...）
+     */
+    private indexToColLetter(n: number): string {
+        let s = '';
+        while (n > 0) {
+            const rem = (n - 1) % 26;
+            s = String.fromCharCode(65 + rem) + s;
+            n = Math.floor((n - 1) / 26);
+        }
+        return s || 'A';
     }
 
     /**
