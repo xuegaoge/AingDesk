@@ -314,6 +314,109 @@ export class MCPClient {
     }
 
     /**
+     * 统一路径分隔符并清洗异常前缀（如被拼接到 C:\AingDesk 上、或前缀多出一个点）
+     */
+    private sanitizeFilePath(rawPath: string, preferCandidate?: string): string {
+        if (!rawPath || typeof rawPath !== 'string') return rawPath;
+        let p = rawPath.trim();
+        // 统一分隔符为反斜杠（正反斜杠都归一为单个反斜杠）
+        p = p.replace(/[\\/]+/g, '\\');
+        // 去除中英文引号
+        p = p.replace(/[“”"']+/g, '');
+        // 去掉开头错误的点前缀：.D:\work\...
+        p = p.replace(/^\.([A-Za-z]:\\)/, '$1');
+        // 如果被错误拼接到 AingDesk 路径前面，尝试提取最后一个绝对盘符路径
+        if (/AingDesk/i.test(p)) {
+            const matches = p.match(/[A-Za-z]:\\[^\\]+(?:\\[^\\]+)*/g);
+            if (matches && matches.length > 0) {
+                // 优先选择包含 D:\work 的候选
+                const prefer = matches.find(m => /^D:\\work(\\|$)/i.test(m));
+                p = (prefer || matches[matches.length - 1]);
+            } else if (preferCandidate) {
+                p = preferCandidate;
+            }
+        }
+        // 再次修正可能出现的双盘符或奇怪的前缀，比如 C:\AingDesk\.D:\work\...
+        const lastAbs = p.match(/([A-Za-z]:\\[^\\]+(?:\\[^\\]+)*)/g);
+        if (lastAbs && lastAbs.length > 0) {
+            const prefer = lastAbs.find(m => /^D:\\work(\\|$)/i.test(m));
+            p = (prefer || lastAbs[lastAbs.length - 1]);
+        }
+        // 最终兜底：确保是以盘符开头的绝对路径
+        if (!/^[A-Za-z]:\\/.test(p) && preferCandidate && /^[A-Za-z]:\\/.test(preferCandidate)) {
+            p = preferCandidate;
+        }
+        return p;
+    }
+
+    /**
+     * 从文本中提取 Windows 绝对路径（优先选择位于 D:\work 下的路径）
+     */
+    private extractWindowsPath(text: string): string | null {
+        if (!text || typeof text !== 'string') return null;
+        // 捕获 Windows 绝对路径，排除空格、尖括号和中英文引号
+        const regex = /[A-Za-z]:\\[^\s<>"'“”]+/g;
+        const matches = text.match(regex);
+        if (!matches || matches.length === 0) return null;
+        const clean = (p: string) => p.replace(/[“”"']+/g, '').trim();
+        const cleaned = matches.map(clean);
+        const prefer = cleaned.find(m => /^D:\\work(\\|$)/i.test(m));
+        return prefer || cleaned[0];
+    }
+
+    /**
+     * 确保 FileSystem 相关工具调用具备并纠正 file_path 参数
+     */
+    private ensureFilePathArg(toolName: string, toolArgs: any, toolsContent: string, messages: ChatCompletionMessageParam[]): any {
+        // 工具名为拆分后的短名：read_text_file/read_json_file/write_file
+        const fsToolNames = new Set(["read_text_file", "read_json_file", "write_file", "append_file", "append_text_file", "read_file"]);
+        const isFS = fsToolNames.has(toolName) || (/read/i.test(toolName) && /file/i.test(toolName)) || (/write|append/i.test(toolName) && /file/i.test(toolName));
+        if (!isFS) return toolArgs;
+
+        let candidate: string | null = null;
+        // 优先从工具内容里找路径
+        if (toolsContent) {
+            candidate = this.extractWindowsPath(toolsContent);
+        }
+        // 再尝试从最近的用户消息里找路径
+        if (!candidate) {
+            const lastUser = [...messages].reverse().find(m => m.role === 'user' && typeof m.content === 'string') as ChatCompletionMessageParam | undefined;
+            if (lastUser && typeof lastUser.content === 'string') {
+                candidate = this.extractWindowsPath(lastUser.content as string);
+            }
+        }
+
+        // 接受模型可能提供的多个字段名，并归一到 file_path
+        const provided = toolArgs?.file_path || toolArgs?.path || toolArgs?.file || toolArgs?.filename;
+        let sanitized: string | undefined;
+        if (!provided && candidate) {
+            sanitized = this.sanitizeFilePath(candidate || '', candidate || undefined);
+        } else if (provided && typeof provided === 'string') {
+            sanitized = this.sanitizeFilePath(provided, candidate || undefined);
+        }
+
+        if (sanitized) {
+            // 同步设置 file_path 与 path，确保兼容不同服务器的参数命名
+            toolArgs.file_path = sanitized;
+            toolArgs.path = sanitized;
+            // 清理其他可能存在但非绝对路径的歧义字段
+            if (typeof toolArgs.file === 'string' && !/^[A-Za-z]:\\/.test(toolArgs.file)) {
+                delete toolArgs.file;
+            }
+            if (typeof toolArgs.filename === 'string' && !/^[A-Za-z]:\\/.test(toolArgs.filename)) {
+                delete toolArgs.filename;
+            }
+        }
+
+        // 关键日志，帮助定位后续问题
+        try {
+            logger.info(`[MCP FS] tool="${toolName}", provided="${provided}", candidate="${candidate}", sanitized="${sanitized}"`);
+        } catch {}
+
+        return toolArgs;
+    }
+
+    /**
      * 工具调用
      * @param {Record<string, OpenAI.Chat.Completions.ChatCompletionMessageToolCall>} toolCallMap - 工具调用映射
      * @param {ChatCompletionMessageParam[]} messages - 消息列表
@@ -332,7 +435,18 @@ export class MCPClient {
             if (!session) {
                 continue;
             }
-            const toolArgs = JSON.parse(toolCall.function.arguments);
+            let toolArgs: any = {};
+            try {
+                toolArgs = JSON.parse(toolCall.function.arguments);
+            } catch (e) {
+                logger.error(`Failed to parse tool arguments for ${toolName}:`, e);
+                // 尝试容错：继续执行但以空对象为参数
+                toolArgs = {};
+            }
+
+            // 规范化并纠正 FileSystem 路径参数
+            toolArgs = this.ensureFilePathArg(toolName, toolArgs, toolsContent, messages);
+
             const toolResult = await this.executeToolCall(session, toolName, toolArgs);
             const toolResultContent = this.processToolResult(toolResult);
 
@@ -353,6 +467,42 @@ export class MCPClient {
     private isValidToolCall(toolCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall): boolean {
         if(toolCall.function && toolCall.function.name && toolCall.function.arguments) return true;
         return false;
+    }
+
+    /**
+     * 解析用户消息，识别是否需要强制调用特定工具
+     * 根据可用工具列表返回完整的函数名（形如 "<server>__<tool>"），否则返回 null
+     */
+    private extractPreferredToolName(messages: ChatCompletionMessageParam[], availableTools: any[]): string | null {
+        // 寻找最后一条用户消息（文本）
+        const lastUser = [...messages].reverse().find(m => m.role === 'user' && typeof m.content === 'string') as ChatCompletionMessageParam | undefined;
+        if (!lastUser || typeof lastUser.content !== 'string') return null;
+
+        const textRaw = lastUser.content as string;
+        const text = textRaw.toLowerCase();
+
+        // 识别显式意图与路径提示（Windows 路径）
+        const explicitlyAskMCP = text.includes("使用mcp工具") || text.includes("mcp 工具") || text.includes("mcp");
+        const hasWindowsPath = /[a-z]:\\\\/i.test(text) || /[a-z]:\\/i.test(text);
+
+        // 简单意图分类
+        let suffix: string | null = null;
+        if (explicitlyAskMCP || hasWindowsPath) {
+            const wantRead = text.includes("读取") || text.includes("读");
+            const wantWrite = text.includes("写入") || text.includes("追加") || text.includes("覆盖");
+
+            if (wantRead) {
+                if (text.includes("json")) suffix = "__read_json_file"; else suffix = "__read_text_file";
+            } else if (wantWrite) {
+                suffix = "__write_file";
+            }
+        }
+
+        if (!suffix) return null;
+
+        // 在可用工具列表中按结尾匹配函数名
+        const found = availableTools.find((t: any) => t && t.function && typeof t.function.name === 'string' && t.function.name.endsWith(suffix));
+        return found ? found.function.name : null;
     }
 
     /**
@@ -475,49 +625,71 @@ export class MCPClient {
         if (Object.keys(toolCallMap).length > 0) {
             messages = await this.callTools(toolCallMap, messages, toolsContent);
             let last_message = messages[messages.length - 1];
-            if(last_message.content) {
-                // 内容以<end>开头，且以</end>结束的,不递归工具调用，原样输出
-                let content = last_message.content.toString().trim()
-                let toolMessage = JSON.parse(content);
-                if(toolMessage && toolMessage.length > 0 && toolMessage[0].text){
-                    content = toolMessage[0].text;
-                    if(content.startsWith("<end>") && content.endsWith("</end>")){
-                        content = content.replace("<end>", "").replace("</end>", "").trim();
-                        let chunk = {
-                            created_at: Date.now(),
-                            index: 0,
-                            choices: [
-                                {
-                                    finish_reason: "stop",
-                                    delta: {
-                                        content: content
-                                    }
-                                }
-                            ]
-                        }
-                        this.callback(chunk);
-                        return;
-                    }
 
-                    if(content.startsWith("<echo>") && content.endsWith("</echo>")){
-                        content = content.replace("<echo>", "").replace("</echo>", "").trim();
-                        let chunk = {
-                            created_at: Date.now(),
-                            index: 0,
-                            choices: [
-                                {
-                                    finish_reason: "",
-                                    delta: {
-                                        content: content
+            // 尝试解析工具返回的文本，并在满足条件时直接结束流
+            if (last_message.content) {
+                let extractedText: string | null = null;
+                try {
+                    let contentStr = last_message.content.toString().trim();
+                    let toolMessage = JSON.parse(contentStr);
+                    if (toolMessage && Array.isArray(toolMessage) && toolMessage.length > 0 && toolMessage[0].text) {
+                        extractedText = (toolMessage[0].text as string).trim();
+
+                        // 若内容以 <end> / </end> 包裹，去掉包裹并以 stop 结束
+                        if (extractedText.startsWith("<end>") && extractedText.endsWith("</end>")) {
+                            extractedText = extractedText.replace("<end>", "").replace("</end>", "").trim();
+                            const chunk = {
+                                created_at: Date.now(),
+                                index: 0,
+                                choices: [
+                                    {
+                                        finish_reason: "stop",
+                                        delta: { content: extractedText }
                                     }
-                                }
-                            ]
+                                ]
+                            };
+                            this.callback(chunk);
+                            return;
                         }
-                        this.callback(chunk);
+
+                        // 若内容以 <echo> / </echo> 包裹，去掉包裹并以 stop 结束
+                        if (extractedText.startsWith("<echo>") && extractedText.endsWith("</echo>")) {
+                            extractedText = extractedText.replace("<echo>", "").replace("</echo>", "").trim();
+                            const chunk = {
+                                created_at: Date.now(),
+                                index: 0,
+                                choices: [
+                                    {
+                                        finish_reason: "stop",
+                                        delta: { content: extractedText }
+                                    }
+                                ]
+                            };
+                            this.callback(chunk);
+                            return;
+                        }
                     }
+                } catch (e) {
+                    // 忽略解析错误，进入递归逻辑
+                }
+
+                // 当工具返回了纯文本（不含 <end>/<echo>）时，直接以 stop 结束，避免递归导致不复位
+                if (extractedText) {
+                    const chunk = {
+                        created_at: Date.now(),
+                        index: 0,
+                        choices: [
+                            {
+                                finish_reason: "stop",
+                                delta: { content: extractedText }
+                            }
+                        ]
+                    };
+                    this.callback(chunk);
+                    return;
                 }
             }
-            // 递归处理工具调用
+            // 递归处理工具调用（上述未命中终止条件时）
             await this.handleToolCalls(availableTools, messages, true);
         }
         return messages;
@@ -533,11 +705,18 @@ export class MCPClient {
     async handleToolCalls(availableTools: any, messages: ChatCompletionMessageParam[], isRecursive = false) {
         // 调用OpenAI API
         try {
+            // 根据用户最新消息尝试强制选择工具，避免模型在重复请求中不再调用 MCP
+            let toolChoice: any = "auto";
+            const preferredToolName = this.extractPreferredToolName(messages, availableTools);
+            if (preferredToolName) {
+                toolChoice = { type: "function", function: { name: preferredToolName } };
+            }
+
             const completion = await this.openai.chat.completions.create({
                 model: this.model,
                 messages,
                 tools: availableTools,
-                tool_choice: "auto",
+                tool_choice: toolChoice,
                 stream: true
             });
 
