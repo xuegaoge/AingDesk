@@ -1,0 +1,25 @@
+var import_ee_core = require("ee-core");
+var import_lifecycle = require("./preload/lifecycle");
+var import_preload = require("./preload");
+var import_total = require("./service/total");
+const app = new import_ee_core.ElectronEgg();
+const life = new import_lifecycle.Lifecycle();
+app.register("ready", life.ready);
+app.register("electron-app-ready", life.electronAppReady);
+app.register("window-ready", life.windowReady);
+app.register("before-close", life.beforeClose);
+app.register("preload", import_preload.preload);
+setTimeout(() => {
+  const { shareService } = require("./service/share");
+  const { mcpService } = require("./service/mcp");
+  const shareIdPrefix = shareService.generateUniquePrefix();
+  let socket = shareService.connectToCloudServer(shareIdPrefix);
+  shareService.startReconnect(socket, shareIdPrefix);
+  const { RagTask } = require("./rag/rag_task");
+  let ragTaskObj = new RagTask();
+  ragTaskObj.parseTask();
+  ragTaskObj.switchToCosineIndex();
+  mcpService.sync_cloud_mcp();
+}, 1e3);
+import_total.totalService.start();
+app.run();

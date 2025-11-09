@@ -605,7 +605,9 @@ export class ToChatService {
                     const mcpServers = await MCPClient.getActiveServers(mcp_servers);
                     const mcpClient = new MCPClient();
                     await mcpClient.connectToServer(mcpServers);
-                    mcpClient.processQuery(openaiObj, supplierName, modelStr, history, ResEvent, PushOther);
+                    await mcpClient.processQuery(openaiObj, supplierName, modelStr, history, ResEvent, PushOther);
+                    // 清理连接，避免 excel-mcp-server 输出错误
+                    await mcpClient.cleanup();
                 } else {
                     return pub.lang("模型连接失败:{}", modelService.error);
                 }

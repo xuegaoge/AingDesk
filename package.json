@@ -51,7 +51,7 @@
     "cross-env": "^7.0.3",
     "debug": "^4.4.0",
     "ee-bin": "^4.1.1",
-    "electron": "^31.7.6",
+    "electron": "^31.7.7",
     "electron-builder": "^25.1.8",
     "icon-gen": "^5.0.0",
     "typescript": "^5.4.2",

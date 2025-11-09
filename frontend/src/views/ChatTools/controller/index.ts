@@ -1,7 +1,7 @@
 import { nextTick, ref } from "vue"
 import { post } from "@/api"
-import axios from "axios"
 import { eventBUS } from "@/views/Home/utils/tools"
+import { instance } from "@/api"
 import { sendLog } from "@/views/Home/controller"
 import { create_chat, getChatInfo } from "@/views/Sider/controller"
 import { message, } from "@/utils/naive-tools"
@@ -78,7 +78,7 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
 
         if (!multiModelList) {
             // 单模型下发送对话
-            await axios.post("http://127.0.0.1:7071/chat/chat", {
+            await sendStreamChat({
                 model,
                 parameters,
                 supplierName: currentSupplierName.value,
@@ -88,19 +88,11 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
                 temp_chat: String(temp_chat.value),
                 mcp_servers: mcpListChoosed.value,
                 ...params
-            }, {
-                responseType: 'text',
-                onDownloadProgress: (progressEvent: any) => {
-                    // 获取当前接收到的部分响应数据
-                    const currentResponse = progressEvent.event.currentTarget.responseText;
-                    // 防止切换带来的错误
-                    if (currentTalkingChatId.value == currentContextId.value) chatHistory.value.set(currentChat!, { content: currentResponse, stat: { model: currentModel.value }, id: "" })
-                }
-            })
+            }, currentChat, chatHistory)
         } else {
-            
+
             for (let i = 0; i < multiModelList!.length; i++) {
-                const chatAxios = axios.post("http://127.0.0.1:7071/chat/chat", {
+                const chatAxios = sendStreamChat({
                     model: multiModelList![i].model,
                     parameters: multiModelList![i].parameters,
                     supplierName: multiModelList![i].supplierName,
@@ -111,22 +103,7 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
                     mcp_servers: mcpListChoosed.value,
                     compare_id: compare_id.value,
                     ...params
-                }, {
-                    responseType: 'text',
-                    onDownloadProgress: (progressEvent: any) => {
-                        // 获取当前接收到的部分响应数据
-                        const currentResponse = progressEvent.event.currentTarget.responseText;
-                        // 防止切换带来的错误
-                        if (currentTalkingChatId.value == currentContextId.value) {
-                            const chat = chatHistory.value.get(currentChat!)
-                            chat!.content = [...chat?.content as string[]]
-                            chat!.content[i] = currentResponse;
-                            (chat!.stat as any)[i] = { model: multiModelList![i].model } as any
-                            chat!.id = ""
-                            // chatHistory.value.set(currentChat!, { content: currentResponse, stat: { model: currentModel.value }, id: "" })
-                        }
-                    }
-                })
+                }, currentChat, chatHistory)
 
                 chatAxiosArr.push(chatAxios)
             }
@@ -149,6 +126,98 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
         isInChat.value = false
     } catch (error) {
         sendLog(error as Error)
+    }
+}
+
+/**
+ * 发送流式对话请求 - 使用XMLHttpRequest实时跟踪响应
+ * @param params 请求参数
+ * @param currentChat 当前聊天记录
+ * @param chatHistory 聊天历史存储
+ */
+async function sendStreamChat(params: any, currentChat: MultipeQuestionDto | null, chatHistory: any) {
+    return new Promise<void>((resolve, reject) => {
+        const baseURL = import.meta.env.VITE_BASE_URL
+        const url = `${baseURL}/chat/chat`
+
+        // 使用 XMLHttpRequest 来实时跟踪响应
+        const xhr = new XMLHttpRequest()
+
+        xhr.open('POST', url, true)
+        xhr.setRequestHeader('Content-Type', 'application/json')
+
+        // 跟踪当前的完整响应
+        let fullResponse = ""
+
+        // 监听响应进度
+        xhr.onprogress = () => {
+            // 使用 xhr.responseText 获取到目前为止的所有响应数据（自动累积）
+            if (xhr.responseText) {
+                fullResponse = xhr.responseText
+
+                // 实时更新 UI - 关键：创建新的 Map 来触发 Vue 响应式更新
+                if (currentChat && chatHistory.value) {
+                    // 创建新的 Map 实例来触发响应式
+                    const newMap = new Map(chatHistory.value)
+                    const chat = newMap.get(currentChat)
+                    if (chat) {
+                        // 更新内容
+                        if (typeof chat.content === 'string') {
+                            chat.content = fullResponse
+                        } else if (Array.isArray(chat.content)) {
+                            // 多模型情况
+                            chat.content[0] = fullResponse
+                        }
+                    }
+                    // 关键：替换整个 Map 来触发 Vue 响应式系统
+                    chatHistory.value = newMap
+                }
+            }
+        }
+
+        xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                // 请求成功完成，确保最终内容已更新
+                if (currentChat && chatHistory.value) {
+                    // 创建新的 Map 实例来触发响应式
+                    const newMap = new Map(chatHistory.value)
+                    const chat = newMap.get(currentChat)
+                    if (chat) {
+                        finalUpdateChatContent(chat, fullResponse || xhr.responseText)
+                    }
+                    // 关键：替换整个 Map 来触发 Vue 响应式系统
+                    chatHistory.value = newMap
+                }
+                resolve()
+            } else {
+                reject(new Error(`HTTP error! status: ${xhr.status}`))
+            }
+        }
+
+        xhr.onerror = () => {
+            reject(new Error('Network error'))
+        }
+
+        xhr.ontimeout = () => {
+            reject(new Error('Request timeout'))
+        }
+
+        // 设置超时时间（10分钟）
+        xhr.timeout = 600000
+
+        // 发送请求
+        xhr.send(JSON.stringify(params))
+    })
+}
+
+/**
+ * 辅助函数：最终确认更新聊天内容
+ */
+function finalUpdateChatContent(chat: any, content: string) {
+    if (typeof chat.content === 'string') {
+        chat.content = content
+    } else if (Array.isArray(chat.content)) {
+        chat.content[0] = content
     }
 }
 
@@ -342,8 +411,10 @@ export function sendChatToModel() {
 
     /********** 进行单模型和多模型的对话记录拼接 ***********/
     if (multipleModelList.value.length == 0) { // 如果是单模型，则直接拼装
-        // 将chatKey拼装到对话历史记录中
-        chatHistory.value.set(chatKey, { content: "", stat: { model: currentModel.value }, search_result: [] })
+        // 将chatKey拼装到对话历史记录中 - 关键：创建新的 Map 来触发 Vue 响应式更新
+        const newMap = new Map(chatHistory.value)
+        newMap.set(chatKey, { content: "", stat: { model: currentModel.value }, search_result: [] })
+        chatHistory.value = newMap
         // 单模型请求
         sendChat({
             user_content: formatQuestionContent,
@@ -352,8 +423,10 @@ export function sendChatToModel() {
         })
     } else { // 如果是多模型，则进行多模型拼装
         const chatModelParams: MultipleModelListDto[] = [...multipleModelList.value, { model: currentModel.value, supplierName: currentSupplierName.value }]
-        // 多模型对话历史拼装,基本结构
-        chatHistory.value.set(chatKey, { content: [], stat: [], search_result: [] })
+        // 多模型对话历史拼装,基本结构 - 关键：创建新的 Map 来触发 Vue 响应式更新
+        const newMap = new Map(chatHistory.value)
+        newMap.set(chatKey, { content: [], stat: [], search_result: [] })
+        chatHistory.value = newMap
         // 遍历多模型列表，完善多模型历史对话结构
         for (let i = 0; i < chatModelParams.length; i++) {
             const chat = chatHistory.value.get(chatKey)!;
