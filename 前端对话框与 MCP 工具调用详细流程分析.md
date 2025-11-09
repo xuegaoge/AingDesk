@@ -452,6 +452,11 @@ if (!session) {
 }
 ```
 
+### 7.4 读取选项冲突清理（head/tail）
+- 问题表现：某些文件系统工具不允许同时指定 `head` 与 `tail` 参数，否则报错 `Cannot specify both head and tail parameters simultaneously`。
+- 后端修复：当检测到读取类工具（如 `read_text_file/read_file`）的入参同时包含 `head` 与 `tail` 时，后端会移除两者，默认读取全文；若仅存在其一，确保为正整数，否则删除。
+- 影响：自然语言偶发生成冲突参数时，后端自动兜底，避免用户频繁遇到报错。
+
 ## 8. 状态管理总结
 
 ### 8.1 前端状态
@@ -497,6 +502,9 @@ AingDesk 的 MCP 工具集成是一个端到端的完整流程，从前端用户
 - 前端调用约束：
   - 明确工具名（如 `filesystem.read_text_file`）与绝对路径参数，避免仅传相对路径或遗漏关键字段。
   - 返回类型尽量约束为纯文本（`{"type":"text"}`），避免误解析为 JSON 或代码片段。
+ - 目录路径自动拼接文件名（避免 EPERM）：
+   - 当入参路径更像目录（无扩展名/以反斜杠结尾/实际存在且为目录）时，自动从工具参数 `filename`/`file` 或用户文本中提取文件名（如 `2.txt`），与目录合成最终绝对文件路径（例如 `D:\\work\\2.txt`）。
+   - 这样可避免远端工具使用原子写入时将临时文件重命名到目录导致 `EPERM: operation not permitted, rename 'D:\\work.xxxxx.tmp' -> 'D:\\work'` 的错误。
 
 ## 11. 调试与日志
 - Claude Code 调试日志路径：`C:\\Users\\Administrator\\.claude\\debug`
@@ -520,3 +528,15 @@ AingDesk 的 MCP 工具集成是一个端到端的完整流程，从前端用户
 ## 13. 兼容性与扩展
 - 其他 MCP 工具（如 Excel 相关）同样遵循双参数与绝对路径策略，减少跨平台差异引发的异常。
 - 前端显示层应区分“纯文本显示”与“结构化渲染”，并提供开关，避免误解析工具返回内容。
+
+## 14. 工具选择优先级规则（服务器提示与扩展名）
+- 服务器提示优先：当用户文本含有 `excel-mcp-server` 或包含 `excel` 关键词时，优先在服务器名含 `excel` 的工具集中选择。
+- 扩展名偏好：当路径扩展名为 `.xlsx/.xls` 时，若存在 `excel/sheet/workbook` 相关工具，优先选择读写 Excel 的工具。
+- 读取策略：
+  - 优先 `read_*` 且包含 `excel|sheet|workbook`；
+  - 若提到 `json`，优先 `read_json_file`；
+  - 其次选择 `read_text_file`；兜底匹配含 `read` 且与 `file/text/content` 相关的工具。
+- 写入策略：
+  - 优先 `write|append_*` 且包含 `excel|sheet|workbook`；
+  - 其次选择 `write_file`/`append_text_file`；兜底匹配含 `write|append` 且与 `file/text/content` 相关的工具。
+- 回退说明：若提示了 Excel，但该服务器没有匹配的读写工具，将自动回退到通用 FileSystem 工具，保证任务可完成。
