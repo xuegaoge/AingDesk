@@ -3,3 +3,9 @@ lang.py
 yarn.lock
 node_modules
 package-lock.json
+/bin
+/logs
+/.playwright-mcp
+/data/context
+/data/models
+/sys_data
