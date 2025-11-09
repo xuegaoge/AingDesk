@@ -506,6 +506,17 @@ export class ToChatService {
                 requestOption.temperature = 0.6;
             }
         }
+        // 若前端未明确传入 mcp_servers，但本地存在已启用的MCP服务器，则默认启用，避免“有时不调用”的不一致
+        if (!mcp_servers || mcp_servers.length === 0) {
+            try {
+                const activeServers = await MCPClient.getActiveServers();
+                if (activeServers && activeServers.length > 0) {
+                    mcp_servers = activeServers.map(s => s.name);
+                }
+            } catch (e) {
+                // 忽略自动启用失败，保持原逻辑
+            }
+        }
         if (mcp_servers.length > 0) {
             isOllama = false;
         }
@@ -535,7 +546,7 @@ export class ToChatService {
                 return;
             }
             if ((isOllama && chunk.done) ||
-                (!isOllama && (chunk.choices[0].finish_reason === 'stop' || chunk.choices[0].finish_reason === 'normal'))) {
+                (!isOllama && (['stop', 'normal', 'length', 'content_filter'].includes(chunk.choices[0]?.finish_reason)))) {
                 const resInfo = getResponseInfo(chunk, isOllama, modelStr, resTimeMs);
                 chatHistoryRes.created_at = chunk.created_at ? chunk.created_at.toString() : chunk.created;
                 chatHistoryRes.create_time = chunk.created ? chunk.created : pub.time();
