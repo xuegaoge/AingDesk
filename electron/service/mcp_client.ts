@@ -60,7 +60,7 @@ export class MCPClient {
     private static async readMCPConfigFile(): Promise<string | null> {
         // 优先读取用户数据目录（Roaming）下的配置文件，其路径示例：
         // C:\Users\Administrator\AppData\Roaming\AingDesk\data\mcp-server.json
-        const userMcpConfigFile = path.resolve(pub.get_user_data_path(), "AingDesk", "data", "mcp-server.json");
+        const userMcpConfigFile = path.resolve(pub.get_user_data_path(), "data", "mcp-server.json");
         // 工作区 data 目录（供开发调试使用）
         const workspaceMcpConfigFile = path.resolve(pub.get_data_path(), "mcp-server.json");
         try {
