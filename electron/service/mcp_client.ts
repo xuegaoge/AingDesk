@@ -64,6 +64,13 @@ export class MCPClient {
         } catch (error) {
             logger.error('Failed to read MCP config file:', error);
         }
+        // Excel 兜底偏好：若用户暗示 Excel，但未显式读/写意图
+        if (hintExcel) {
+            const excelDefaultRead = pickBy(e => /read/i.test(e.tool) && /excel|sheet|workbook/i.test(e.tool));
+            if (excelDefaultRead) return excelDefaultRead;
+            const anyExcel = pickBy(e => /excel|sheet|workbook/i.test(e.tool));
+            if (anyExcel) return anyExcel;
+        }
         return null;
     }
 
@@ -344,13 +351,133 @@ export class MCPClient {
             return JSON.stringify(parsed);
         }
 
-        // 若为纯文本，包装为 [{text}]，以便上游直接结束流并展示为纯文本
+        // 二进制内容阻断：提示使用 Excel 相关工具
+        if (typeof raw === 'string' && this.isLikelyBinaryText(raw)) {
+            const msg = "检测到可能的二进制内容（例如 Excel 工作簿或压缩包）。请使用 Excel 相关 MCP 工具读取，如 `excel-mcp-server__read_data_from_excel`。";
+            return JSON.stringify([{ type: 'text', text: msg }]);
+        }
+
+        // 若为纯文本，优先尝试按 CSV/TSV 渲染为 Markdown 表格
         if (typeof raw === 'string') {
+            const mdDelimited = this.tryFormatDelimitedTextAsMarkdown(raw);
+            if (mdDelimited) {
+                return JSON.stringify([{ type: 'text', text: mdDelimited }]);
+            }
             return JSON.stringify([{ type: 'text', text: raw }]);
         }
 
         // 兜底：序列化原始内容
         return JSON.stringify(toolResult.content);
+    }
+
+    /**
+     * 尝试将 CSV/TSV 文本渲染为 Markdown 表格
+     */
+    private tryFormatDelimitedTextAsMarkdown(text: string): string | null {
+        const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+        if (lines.length < 2) return null;
+
+        // 选择分隔符：优先 TSV，其次 CSV
+        let delim = '';
+        if (text.includes('\t')) {
+            delim = '\t';
+        } else {
+            const commaCountFirst = (lines[0].match(/,/g) || []).length;
+            if (commaCountFirst >= 1) {
+                // 检查行间一致性（粗略）
+                const consistent = lines.slice(1).every(l => (l.match(/,/g) || []).length === commaCountFirst);
+                if (consistent) delim = ',';
+            }
+        }
+        if (!delim) return null;
+
+        const parseDelimitedLine = (line: string, d: string): string[] => {
+            if (d === '\t') {
+                return line.split('\t').map(s => s.replace(/\|/g, '\\|'));
+            }
+            // 简易 CSV 解析，支持双引号包裹与逗号分隔
+            const tokens: string[] = [];
+            let cur = '';
+            let inQuotes = false;
+            for (let i = 0; i < line.length; i++) {
+                const ch = line[i];
+                if (ch === '"') {
+                    // 处理转义双引号
+                    if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
+                        cur += '"';
+                        i++; // 跳过下一个引号
+                    } else {
+                        inQuotes = !inQuotes;
+                    }
+                } else if (ch === d && !inQuotes) {
+                    tokens.push(cur.replace(/\|/g, '\\|'));
+                    cur = '';
+                } else {
+                    cur += ch;
+                }
+            }
+            tokens.push(cur.replace(/\|/g, '\\|'));
+            return tokens.map(s => s.replace(/\n/g, ' '));
+        };
+
+        const rows = lines.map(l => parseDelimitedLine(l, delim));
+        const colCount = Math.max(...rows.map(r => r.length));
+        if (colCount < 1) return null;
+
+        // 自动表头识别（与 Excel 相同策略）
+        const isNumeric = (s: string) => /^\s*-?\d+(\.\d+)?\s*$/.test(s);
+        const isLikelyHeader = (s: string) => /[A-Za-z\u4e00-\u9fff]/.test(s) && !isNumeric(s);
+        const top = rows[0];
+        const nonEmptyTop = top.filter(v => (v || '').trim().length > 0);
+        const headerLikeCount = nonEmptyTop.filter(isLikelyHeader).length;
+        const useTopAsHeader = nonEmptyTop.length > 0 && headerLikeCount >= Math.max(1, Math.floor(nonEmptyTop.length * 0.6));
+
+        const headers: string[] = [];
+        if (useTopAsHeader) {
+            for (let i = 0; i < colCount; i++) headers.push(((top[i] || '').trim()) || `列${i + 1}`);
+        } else {
+            for (let i = 0; i < colCount; i++) headers.push(`列${i + 1}`);
+        }
+
+        const md: string[] = [];
+        md.push(`| ${headers.join(' | ')} |`);
+        md.push(`| ${headers.map(() => '---').join(' | ')} |`);
+        const startRow = useTopAsHeader ? 1 : 0;
+        for (let r = startRow; r < rows.length; r++) {
+            const row = rows[r];
+            const vals: string[] = [];
+            for (let c = 0; c < colCount; c++) {
+                const rawV = (row[c] !== undefined && row[c] !== null) ? String(row[c]) : '';
+                const v = rawV.trim().length > 0 ? rawV : '空';
+                vals.push(v);
+            }
+            md.push(`| ${vals.join(' | ')} |`);
+        }
+        return md.join('\n');
+    }
+
+    /**
+     * 简易二进制文本检测：用于阻止直接显示压缩包或 Excel 工作簿等原始字节
+     */
+    private isLikelyBinaryText(text: string): boolean {
+        if (typeof text !== 'string') return false;
+        if (text.length === 0) return false;
+        // ZIP 文件特征（xlsx/docx 等）
+        if (text.length > 1024 && /PK\x03\x04/.test(text)) return true;
+        const samples = text.slice(0, Math.min(text.length, 4000));
+        let ctrl = 0;
+        for (let i = 0; i < samples.length; i++) {
+            const ch = samples[i];
+            const code = samples.charCodeAt(i);
+            const isPrintableAscii = code >= 0x20 && code <= 0x7E;
+            const isCommonWhitespace = code === 0x09 || code === 0x0A || code === 0x0D;
+            const isCJK = (code >= 0x4E00 && code <= 0x9FFF);
+            const isPunctCJK = '，。！？、；：“”‘’（）《》【】'.includes(ch);
+            const isAllowed = isPrintableAscii || isCommonWhitespace || isCJK || isPunctCJK;
+            if (!isAllowed && code < 0x20) ctrl++;
+        }
+        const ratio = ctrl / samples.length;
+        return ratio > 0.02; // 控制字符比例阈值
     }
 
     /**
@@ -369,18 +496,19 @@ export class MCPClient {
             const ac = (a.column ?? 0), bc = (b.column ?? 0);
             return ac - bc;
         });
-        // 若为矩形区域（如 A1:B10 或 A1:C3），生成最简 Markdown 表格
+
+        // 增强：无论 range 是否为标准矩形，都尝试以“包含所有单元格的外接矩形”渲染 Markdown 表格
         const md = this.tryFormatExcelCellsAsMarkdown(range, cells);
         if (md) {
-            // 在表格前输出表头信息，便于定位
             return `${header}\n\n${md}`;
         }
 
-        // 默认纯文本渲染（按地址逐行显示）
+        // 默认纯文本渲染（按地址逐行显示），统一空单元格展示
         const lines: string[] = [header];
         for (const c of cells) {
-            const addr = (c.address || (typeof c.column === 'number' && typeof c.row === 'number' ? `R${c.row}C${c.column}` : '')).toString();
-            const value = (c.value !== undefined && c.value !== null) ? String(c.value) : '';
+            const addr = (c.address || (typeof c.column === 'number' && typeof c.row === 'number' ? `${this.indexToColLetter(Number(c.column))}${Number(c.row)}` : '')).toString();
+            const valueRaw = (c.value !== undefined && c.value !== null) ? String(c.value) : '';
+            const value = valueRaw.trim().length > 0 ? valueRaw : '空';
             lines.push(`${addr}: ${value}`);
         }
         return lines.join('\n');
@@ -391,37 +519,71 @@ export class MCPClient {
      * 仅在 range 形如 "A1:B10"、"A1:C3" 等矩形时生效
      */
     private tryFormatExcelCellsAsMarkdown(range: string, cells: any[]): string | null {
-        const parsed = this.parseExcelRange(range);
-        if (!parsed) return null;
-        const { startCol, endCol, startRow, endRow } = parsed;
-        if (startCol > endCol || startRow > endRow) return null;
+        if (!Array.isArray(cells) || cells.length === 0) return null;
 
-        // 将单元格按行/列归档，便于表格输出
-        const grid = new Map<number, Map<number, string>>(); // row -> (col -> value)
+        // 计算所有单元格的外接矩形（支持非矩形输入与超出 range 的单元格）
+        let minCol = Infinity, maxCol = -Infinity, minRow = Infinity, maxRow = -Infinity;
         for (const c of cells) {
-            const r = Number(c.row);
-            const colNum = Number(c.column);
+            const r = Number(c.row), colNum = Number(c.column);
             if (!Number.isFinite(r) || !Number.isFinite(colNum)) continue;
-            if (r < startRow || r > endRow || colNum < startCol || colNum > endCol) continue;
-            const val = (c.value !== undefined && c.value !== null) ? String(c.value) : '';
+            if (r < minRow) minRow = r;
+            if (r > maxRow) maxRow = r;
+            if (colNum < minCol) minCol = colNum;
+            if (colNum > maxCol) maxCol = colNum;
+        }
+
+        // 若提供了矩形 range，则与外接矩形取并集，避免遗漏额外单元格（如 A4）
+        const parsed = this.parseExcelRange(range);
+        if (parsed) {
+            minCol = Math.min(minCol, parsed.startCol);
+            maxCol = Math.max(maxCol, parsed.endCol);
+            minRow = Math.min(minRow, parsed.startRow);
+            maxRow = Math.max(maxRow, parsed.endRow);
+        }
+
+        if (!Number.isFinite(minCol) || !Number.isFinite(maxCol) || !Number.isFinite(minRow) || !Number.isFinite(maxRow)) return null;
+        if (minCol > maxCol || minRow > maxRow) return null;
+
+        // 构建网格 row -> (col -> value)
+        const grid = new Map<number, Map<number, string>>();
+        for (const c of cells) {
+            const r = Number(c.row), colNum = Number(c.column);
+            if (!Number.isFinite(r) || !Number.isFinite(colNum)) continue;
+            const valRaw = (c.value !== undefined && c.value !== null) ? String(c.value) : ' ';
+            const val = valRaw.replace(/\|/g, '\\|').replace(/\n/g, ' ');
             if (!grid.has(r)) grid.set(r, new Map<number, string>());
             grid.get(r)!.set(colNum, val);
         }
 
-        // 构造表头：使用列字母（A/B/C…）
+        // 自动表头识别：若顶行非纯数字/日期文本占比居多，则认为顶行为表头
+        const isNumeric = (s: string) => /^\s*-?\d+(\.\d+)?\s*$/.test(s);
+        const isLikelyHeader = (s: string) => /[A-Za-z\u4e00-\u9fff]/.test(s) && !isNumeric(s);
+        const topRowMap = grid.get(minRow) || new Map<number, string>();
+        const topVals: string[] = [];
+        for (let col = minCol; col <= maxCol; col++) topVals.push(topRowMap.get(col) || ' ');
+        const nonEmptyTop = topVals.filter(v => v.trim().length > 0);
+        const headerLikeCount = nonEmptyTop.filter(isLikelyHeader).length;
+        const useTopAsHeader = nonEmptyTop.length > 0 && headerLikeCount >= Math.max(1, Math.floor(nonEmptyTop.length * 0.6));
+
+        // 构造表头
         const headers: string[] = [];
-        for (let col = startCol; col <= endCol; col++) headers.push(this.indexToColLetter(col));
+        if (useTopAsHeader) {
+            for (let col = minCol; col <= maxCol; col++) headers.push((topRowMap.get(col) || ' ').trim() || this.indexToColLetter(col));
+        } else {
+            for (let col = minCol; col <= maxCol; col++) headers.push(this.indexToColLetter(col));
+        }
 
         const lines: string[] = [];
         lines.push(`| ${headers.join(' | ')} |`);
         lines.push(`| ${headers.map(() => '---').join(' | ')} |`);
-        for (let row = startRow; row <= endRow; row++) {
+        const startDataRow = useTopAsHeader ? (minRow + 1) : minRow;
+        for (let row = startDataRow; row <= maxRow; row++) {
             const rowMap = grid.get(row) || new Map<number, string>();
             const rowVals: string[] = [];
-            for (let col = startCol; col <= endCol; col++) {
-                const v = rowMap.get(col) || '';
-                // 简单转义竖线，避免破坏 Markdown 列分隔
-                rowVals.push(v.replace(/\|/g, '\\|'));
+            for (let col = minCol; col <= maxCol; col++) {
+                const raw = rowMap.get(col);
+                const v = (raw !== undefined && raw !== null && String(raw).trim().length > 0) ? String(raw) : '空';
+                rowVals.push(v);
             }
             lines.push(`| ${rowVals.join(' | ')} |`);
         }
@@ -503,6 +665,30 @@ export class MCPClient {
     }
 
     /**
+     * 增强版路径清理：处理伪协议、中文引号、盘符规范化与 .<server> 前缀回退
+     */
+    private sanitizeFilePathV2(rawPath: string, preferCandidate?: string): string {
+        if (!rawPath || typeof rawPath !== 'string') return rawPath;
+        let p = rawPath.trim();
+        // 统一分隔符为反斜杠
+        p = p.replace(/[\\/]+/g, '\\');
+        // 去除中英文引号（含中文单引号）
+        p = p.replace(/[“”"'‘’]+/g, '');
+        // 处理伪协议前缀（excel:, file:, fs:, mcp:）
+        p = p.replace(/^(excel|file|fs|mcp):\\?/i, '');
+        // 规范化盘符后没有反斜杠：D:work -> D:\\work
+        p = p.replace(/^([A-Za-z]):(?!\\)/, '$1:\\');
+        // 去掉错误点前缀
+        p = p.replace(/^\.([A-Za-z]:\\)/, '$1');
+        // .<server>\\ 前缀回退为绝对候选
+        if (/^\.[A-Za-z][A-Za-z0-9_-]+\\/.test(p) && preferCandidate && /^[A-Za-z]:\\/.test(preferCandidate)) {
+            p = preferCandidate;
+        }
+        // 复用原有的兜底逻辑
+        return this.sanitizeFilePath(p, preferCandidate);
+    }
+
+    /**
      * 从文本中提取 Windows 绝对路径（优先选择位于 D:\work 下的路径）
      */
     private extractWindowsPath(text: string): string | null {
@@ -511,7 +697,7 @@ export class MCPClient {
         const regex = /[A-Za-z]:\\[^\s<>"'“”]+/g;
         const matches = text.match(regex);
         if (!matches || matches.length === 0) return null;
-        const clean = (p: string) => p.replace(/[“”"']+/g, '').trim();
+        const clean = (p: string) => p.replace(/[“”"'‘’]+/g, '').trim();
         const cleaned = matches.map(clean);
         const prefer = cleaned.find(m => /^D:\\work(\\|$)/i.test(m));
         return prefer || cleaned[0];
@@ -578,8 +764,9 @@ export class MCPClient {
     private extractFileNameCandidate(text?: string): string | null {
         if (!text || typeof text !== 'string') return null;
         // 支持常见文本/数据扩展名
-        const regex = /([\w-]+\.(txt|md|json|csv|log|ini|conf|xml|yml|yaml|html|htm|js|ts|xls|xlsx))/i;
-        const cleaned = text.replace(/[“”"']+/g, ' ').trim();
+        // 允许中文/Unicode 文件名，排除路径分隔与非法字符
+        const regex = /([^\s\\\/<>:"\|\?\*]+?\.(txt|md|json|csv|log|ini|conf|xml|yml|yaml|html|htm|js|ts|xls|xlsx))/i;
+        const cleaned = text.replace(/[“”"'‘’]+/g, ' ').trim();
         const m = cleaned.match(regex);
         if (!m) return null;
         const fn = m[1];
@@ -606,16 +793,52 @@ export class MCPClient {
             }
         }
 
+        // 本地函数：模糊提取工作表名（sheet_name）
+        const pickSheetName = (text?: string | null): string | null => {
+            if (!text || typeof text !== 'string') return null;
+            const patterns: RegExp[] = [
+                /(sheet[_\s-]?name)\s*(?:为|是|:|=)\s*[‘'“"]?([A-Za-z0-9_\-\s\u4e00-\u9fa5]+)[’'”"]?/i,
+                /(工作表|表名|sheet|worksheet)\s*(?:为|是|:|=)\s*[‘'“"]?([A-Za-z0-9_\-\s\u4e00-\u9fa5]+)[’'”"]?/i,
+            ];
+            for (const p of patterns) {
+                const m = text.match(p);
+                if (m && m[2]) {
+                    const raw = m[2];
+                    const cleaned = raw.trim().replace(/[‘’“”"'\s，。；、：]+$/g, '');
+                    return cleaned || null;
+                }
+            }
+            return null;
+        };
+
         const provided = toolArgs?.filename || toolArgs?.file_path || toolArgs?.path || toolArgs?.file;
         let sanitized: string | undefined;
         if (typeof provided === 'string') {
-            sanitized = this.sanitizeFilePath(provided, candidate || undefined);
+            sanitized = this.sanitizeFilePathV2(provided, candidate || undefined);
         } else if (candidate) {
-            sanitized = this.sanitizeFilePath(candidate, candidate || undefined);
+            sanitized = this.sanitizeFilePathV2(candidate, candidate || undefined);
+        }
+
+        // 如果清理后为空或非绝对路径，但存在候选绝对路径，则回退到候选
+        if ((!sanitized || !/^[A-Za-z]:\\/.test(sanitized)) && candidate && /^[A-Za-z]:\\/.test(candidate)) {
+            sanitized = this.sanitizeFilePathV2(candidate, candidate);
         }
 
         if (sanitized) {
             let finalPath = sanitized;
+            // 针对 Excel 文件扩展名，裁切掉跟随的中文标点或说明性文本（如 “，工作表为 ...”）
+            try {
+                const excelExtPattern = /(\.xlsx|\.xlsm|\.xls|\.xltx|\.xltm)/i;
+                const m = finalPath.match(excelExtPattern);
+                if (m) {
+                    const idx = finalPath.indexOf(m[0]);
+                    if (idx >= 0) {
+                        finalPath = finalPath.slice(0, idx + m[0].length);
+                    }
+                }
+                // 去除末尾的中文/英文引号与标点
+                finalPath = finalPath.replace(/[‘’“”"'\s，。；、：]+$/g, '');
+            } catch {}
             const dirLike = this.isDirectoryLikePath(sanitized);
 
             // 如果是目录样式，尝试拼接文件名
@@ -645,10 +868,32 @@ export class MCPClient {
                 }
             }
 
-            // 同步到各字段，优先使用 filename 以兼容 excel-mcp-server
-            toolArgs.filename = finalPath;
-            toolArgs.file_path = finalPath;
-            toolArgs.path = finalPath;
+            // Excel 工具参数同步：兼容服务端对 `filepath` 与 `sheet_name` 的要求
+            // 1) read_data_from_excel：显式传递 { filepath, sheet_name }（仅必要键，避免 extra fields）
+            // 2) 其他 Excel 工具：同步常见字段，包含 filepath/filename/file_path/path，最大化兼容
+            if (toolName === 'read_data_from_excel') {
+                let sheetName: string | null = null;
+                // 优先使用显式字段
+                if (typeof toolArgs?.sheet_name === 'string' && toolArgs.sheet_name.trim()) {
+                    sheetName = toolArgs.sheet_name.trim();
+                } else if (typeof toolArgs?.sheet === 'string' && toolArgs.sheet.trim()) {
+                    sheetName = toolArgs.sheet.trim();
+                } else if (typeof toolArgs?.worksheet === 'string' && toolArgs.worksheet.trim()) {
+                    sheetName = toolArgs.worksheet.trim();
+                }
+                // 其次从工具内容与用户文本模糊提取
+                if (!sheetName) {
+                    const lastText = this.getLastUserText(messages);
+                    sheetName = pickSheetName(toolsContent) || pickSheetName(lastText) || null;
+                }
+                if (!sheetName) sheetName = 'Sheet1';
+                toolArgs = { filepath: finalPath, sheet_name: sheetName };
+            } else {
+                toolArgs.filepath = finalPath;
+                toolArgs.filename = finalPath;
+                toolArgs.file_path = finalPath;
+                toolArgs.path = finalPath;
+            }
 
             // 清理可能引起歧义的相对字段
             if (typeof toolArgs.file === 'string' && !/^[A-Za-z]:\\/.test(toolArgs.file)) {
@@ -657,7 +902,8 @@ export class MCPClient {
         }
 
         try {
-            logger.info(`[MCP Excel] tool="${toolName}", provided="${provided}", candidate="${candidate}", sanitized="${sanitized}", final="${toolArgs?.filename}"`);
+            const finalLog = toolArgs?.filepath || toolArgs?.filename || toolArgs?.file_path || toolArgs?.path;
+            logger.info(`[MCP Excel] tool="${toolName}", provided="${provided}", candidate="${candidate}", sanitized="${sanitized}", final="${finalLog}", sheet_name="${toolArgs?.sheet_name ?? ''}"`);
         } catch {}
 
         return toolArgs;
@@ -667,8 +913,8 @@ export class MCPClient {
      * 目录与文件名拼接为 Windows 绝对路径
      */
     private joinDirAndFile(dir: string, filename: string): string {
-        const d = dir.replace(/[“”"']+/g, '').trim();
-        const f = filename.replace(/[“”"']+/g, '').trim();
+        const d = dir.replace(/[“”"'‘’]+/g, '').trim();
+        const f = filename.replace(/[“”"'‘’]+/g, '').trim();
         return path.win32.join(d, f);
     }
 
@@ -698,9 +944,9 @@ export class MCPClient {
         const provided = toolArgs?.file_path || toolArgs?.path || toolArgs?.file || toolArgs?.filename;
         let sanitized: string | undefined;
         if (!provided && candidate) {
-            sanitized = this.sanitizeFilePath(candidate || '', candidate || undefined);
+            sanitized = this.sanitizeFilePathV2(candidate || '', candidate || undefined);
         } else if (provided && typeof provided === 'string') {
-            sanitized = this.sanitizeFilePath(provided, candidate || undefined);
+            sanitized = this.sanitizeFilePathV2(provided, candidate || undefined);
         }
 
         if (sanitized) {
