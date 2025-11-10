@@ -58,10 +58,19 @@ export class MCPClient {
      * 读取 MCP 配置文件
      */
     private static async readMCPConfigFile(): Promise<string | null> {
-        const mcpConfigFile = path.resolve(pub.get_data_path(), "mcp-server.json");
+        // 优先读取用户数据目录（Roaming）下的配置文件，其路径示例：
+        // C:\Users\Administrator\AppData\Roaming\AingDesk\data\mcp-server.json
+        const userMcpConfigFile = path.resolve(pub.get_user_data_path(), "AingDesk", "data", "mcp-server.json");
+        // 工作区 data 目录（供开发调试使用）
+        const workspaceMcpConfigFile = path.resolve(pub.get_data_path(), "mcp-server.json");
         try {
-            if (pub.file_exists(mcpConfigFile)) {
-                return pub.read_file(mcpConfigFile);
+            // 运行时优先使用用户数据目录下的配置
+            if (pub.file_exists(userMcpConfigFile)) {
+                return pub.read_file(userMcpConfigFile);
+            }
+            // 若用户数据目录不存在该文件，则回退到工作区 data 目录（用于开发阶段）
+            if (pub.file_exists(workspaceMcpConfigFile)) {
+                return pub.read_file(workspaceMcpConfigFile);
             }
         } catch (error) {
             logger.error('Failed to read MCP config file:', error);
