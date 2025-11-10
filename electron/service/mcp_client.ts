@@ -1287,7 +1287,29 @@ export class MCPClient {
             const wantWrite = (/write|append/i.test(toolName));
             toolArgs = this.ensureArgsBySchema(fullToolName, toolArgs, wantWrite);
 
-            const toolResult = await this.executeToolCall(session, toolName, toolArgs);
+            let toolResult: MCPToolResult;
+            try {
+                toolResult = await this.executeToolCall(session, toolName, toolArgs);
+            } catch (err: any) {
+                // Excel 专用容错：工作表未找到时回退为 Sheet1 再重试一次
+                const isExcelTool = /excel|sheet|workbook/i.test(toolName) || toolName === 'read_data_from_excel';
+                const msg = (err && (err.message || err.toString())) || '';
+                const sheetNotFound = /sheet|worksheet/i.test(msg) && /(not\s*found|不存在|no\s*such|missing)/i.test(msg);
+                if (isExcelTool && sheetNotFound) {
+                    try {
+                        const before = toolArgs.sheet_name || toolArgs.sheet || toolArgs.worksheet || '';
+                        toolArgs.sheet_name = 'Sheet1';
+                        delete toolArgs.sheet; delete toolArgs.worksheet;
+                        logger.warn(`[MCP Excel] sheet not found: "${before}", fallback to "Sheet1" and retry`);
+                        toolResult = await this.executeToolCall(session, toolName, toolArgs);
+                    } catch (err2) {
+                        logger.error(`[MCP Excel] retry with Sheet1 failed for ${toolName}:`, err2);
+                        throw err2;
+                    }
+                } else {
+                    throw err;
+                }
+            }
             const toolResultContent = this.processToolResult(toolResult);
 
             const toolResultPush = this.createToolResultPush(serverName, toolName, toolArgs, toolResultContent);
