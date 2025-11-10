@@ -46,6 +46,8 @@ export class MCPClient {
     private transports: Map<string, StdioClientTransport | SSEClientTransport> = new Map();
     // 缓存工具列表
     private toolListCache: any[] | null = null;
+    // 缓存：完整工具名 -> JSON Schema（输入参数）
+    private toolsSchemaByName: Map<string, any> = new Map();
     private supplierName: string = "";
     private model: string = "";
     private openai: OpenAI | null = null;
@@ -296,6 +298,13 @@ export class MCPClient {
                         parameters: tool.inputSchema
                     }
                 }));
+                // 建立 schema 映射缓存，键为完整工具名
+                try {
+                    for (const tool of response.tools) {
+                        const full = `${this.enPunycode(serverName)}__${tool.name}`;
+                        this.toolsSchemaByName.set(full, tool.inputSchema);
+                    }
+                } catch {}
                 availableTools.push(...tools);
             }
             this.toolListCache = availableTools;
@@ -1032,6 +1041,214 @@ export class MCPClient {
     }
 
     /**
+     * 基于工具 JSON Schema 的通用参数归一化：字段别名、类型转换、必填项与默认值、剔除非 schema 字段
+     * @param fullToolName 完整工具名（形如 "server__tool"）
+     * @param toolArgs 原始工具参数
+     * @param wantWrite 是否为写入型工具（影响部分默认策略）
+     */
+    private ensureArgsBySchema(fullToolName: string, toolArgs: any, wantWrite?: boolean): any {
+        try {
+            const schema = this.toolsSchemaByName.get(fullToolName);
+            if (!schema || typeof schema !== 'object') return toolArgs;
+            if (schema.type && schema.type !== 'object') return toolArgs;
+
+            const properties: Record<string, any> = schema.properties || {};
+            const required: string[] = Array.isArray(schema.required) ? schema.required.slice() : [];
+
+            // 选择存在于 schema 中的规范字段作为“正名”
+            const selectCanonical = (candidates: string[]): string | null => {
+                for (const name of candidates) {
+                    if (Object.prototype.hasOwnProperty.call(properties, name)) return name;
+                }
+                return null;
+            };
+
+            // 别名分组：会根据 schema 实际包含的字段选择正名
+            const groups: string[][] = [
+                // 文件路径相关（文件系统/Excel 常见）
+                ['file_path','filepath','path','file','filename'],
+                // 目录路径相关
+                ['directory_path','dir_path','directory','dir','folder'],
+                // Excel 工作表
+                ['sheet_name','sheet','worksheet'],
+                // 写入内容
+                ['content','text','data','body','payload'],
+                // 编码
+                ['encoding','charset'],
+                // HTTP/网络常见参数
+                ['url','uri','link','address'],
+                ['method','http_method','verb'],
+                ['headers','http_headers','header'],
+                // 查询/检索类参数
+                ['query','q','keyword','keywords','search','pattern','prompt','params','parameters'],
+                // 选项/配置
+                ['options','opts','config','settings'],
+                // 超时与重试
+                ['timeout','time_limit','t'],
+                ['retries','retry','attempts']
+            ];
+
+            // 复制一份，避免直接修改传入对象引用引发副作用
+            const args: any = (toolArgs && typeof toolArgs === 'object') ? { ...toolArgs } : {};
+
+            // 别名归一：若正名未设置但存在同组其他别名，则迁移到正名
+            for (const group of groups) {
+                const canonical = selectCanonical(group);
+                if (!canonical) continue;
+                const hasCanonical = Object.prototype.hasOwnProperty.call(args, canonical);
+                if (!hasCanonical) {
+                    for (const name of group) {
+                        if (name === canonical) continue;
+                        if (Object.prototype.hasOwnProperty.call(args, name)) {
+                            args[canonical] = args[name];
+                            break;
+                        }
+                    }
+                }
+                // 删除同组中非正名且不在 schema 中的字段，减少歧义
+                for (const name of group) {
+                    if (name === canonical) continue;
+                    if (!Object.prototype.hasOwnProperty.call(properties, name) && Object.prototype.hasOwnProperty.call(args, name)) {
+                        delete args[name];
+                    }
+                }
+            }
+
+            // 类型转换与默认值填充
+            for (const [key, prop] of Object.entries(properties)) {
+                if (!Object.prototype.hasOwnProperty.call(args, key)) {
+                    // 默认值填充
+                    if (prop && Object.prototype.hasOwnProperty.call(prop, 'default')) {
+                        args[key] = prop.default;
+                        continue;
+                    }
+                    // Excel sheet_name 常用默认
+                    if ((key === 'sheet_name' || key === 'sheet') && !wantWrite) {
+                        args[key] = 'Sheet1';
+                        continue;
+                    }
+                    continue;
+                }
+
+                const val = args[key];
+                const t = prop?.type;
+                if (t === 'integer' || t === 'number') {
+                    if (typeof val === 'string') {
+                        const n = Number(val);
+                        if (Number.isFinite(n)) args[key] = (t === 'integer') ? Math.floor(n) : n; else delete args[key];
+                    } else if (typeof val !== 'number' || !Number.isFinite(val)) {
+                        delete args[key];
+                    } else if (t === 'integer') {
+                        args[key] = Math.floor(val);
+                    }
+                } else if (t === 'boolean') {
+                    if (typeof val === 'string') {
+                        const s = val.trim().toLowerCase();
+                        if (['true','1','yes','y','on'].includes(s)) args[key] = true;
+                        else if (['false','0','no','n','off'].includes(s)) args[key] = false;
+                        else delete args[key];
+                    } else if (typeof val !== 'boolean') {
+                        delete args[key];
+                    }
+                } else if (t === 'array') {
+                    if (!Array.isArray(val)) {
+                        if (typeof val === 'string') {
+                            const items = val.split(/[\n,;]+/).map(s => s.trim()).filter(s => s.length > 0);
+                            args[key] = items;
+                        } else {
+                            delete args[key];
+                        }
+                    }
+                } else if (t === 'object') {
+                    if (val && typeof val === 'object' && !Array.isArray(val)) {
+                        // 保留已是对象的值
+                    } else if (typeof val === 'string') {
+                        let parsed: any = null;
+                        // 优先尝试 JSON 解析
+                        try {
+                            const candidate = val.trim()
+                                // 去掉包裹的大括号或引号
+                                .replace(/^([“”"']?){/, '{').replace(/}([“”"']?)$/, '}');
+                            parsed = JSON.parse(candidate);
+                        } catch {}
+                        if (!parsed) {
+                            // 解析 KV 格式：key:value 或 key=value，多行或分号分隔
+                            const obj: any = {};
+                            const segments = val.split(/[\n;]+/).map(s => s.trim()).filter(s => s.length > 0);
+                            for (const seg of segments) {
+                                const m = seg.match(/^\s*([^:=\s]+)\s*[:=]\s*(.+)\s*$/);
+                                if (m) {
+                                    const k = m[1].trim();
+                                    const v = m[2].trim().replace(/^[“”"']+/, '').replace(/[””"']+$/, '');
+                                    obj[k] = v;
+                                }
+                            }
+                            if (Object.keys(obj).length > 0) parsed = obj;
+                        }
+                        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                            args[key] = parsed;
+                        } else {
+                            delete args[key];
+                        }
+                    } else {
+                        delete args[key];
+                    }
+                } else if (t === 'string') {
+                    if (val === null || val === undefined) {
+                        delete args[key];
+                    } else if (typeof val !== 'string') {
+                        try { args[key] = String(val); } catch { delete args[key]; }
+                    } else {
+                        // 基础清理：去除末尾中文/英文引号与标点
+                        args[key] = val.replace(/[‘’“”"'\s，。；、：]+$/g, '').trim();
+                        // 针对 URL 等格式的进一步清理
+                        const fmt = prop?.format;
+                        if (fmt === 'uri' || /url/i.test(key)) {
+                            let s = args[key];
+                            s = s.replace(/^[“”"'\(\[]+/, '').replace(/[””"'\)\]]+$/, '');
+                            s = s.replace(/[，。；、：]+$/g, '');
+                            args[key] = s.trim();
+                        }
+                        // HTTP 方法统一为大写（若字段名为 method）
+                        if (/^method$/i.test(key)) {
+                            args[key] = args[key].toUpperCase();
+                        }
+                    }
+                    // enum 校验（如存在）
+                    if (Array.isArray(prop?.enum) && Object.prototype.hasOwnProperty.call(args, key)) {
+                        const v = args[key];
+                        if (!prop.enum.includes(v)) {
+                            // 不在枚举中则删除，避免请求失败
+                            delete args[key];
+                        }
+                    }
+                }
+            }
+
+            // 必填项检查：若缺失但存在同组别名已设置，则上面已迁移；此处仅记录日志
+            for (const req of required) {
+                if (!Object.prototype.hasOwnProperty.call(args, req)) {
+                    try { logger.warn(`[MCP Args] required missing for ${fullToolName}: ${req}`); } catch {}
+                }
+            }
+
+            // 仅保留 schema 中声明的字段
+            const finalArgs: any = {};
+            for (const key of Object.keys(properties)) {
+                if (Object.prototype.hasOwnProperty.call(args, key)) {
+                    finalArgs[key] = args[key];
+                }
+            }
+
+            try { logger.info(`[MCP Args] normalized for ${fullToolName}: ${JSON.stringify(finalArgs)}`); } catch {}
+            return finalArgs;
+        } catch (e) {
+            try { logger.error(`[MCP Args] ensureArgsBySchema error for ${fullToolName}:`, e); } catch {}
+            return toolArgs;
+        }
+    }
+
+    /**
      * 工具调用
      * @param {Record<string, OpenAI.Chat.Completions.ChatCompletionMessageToolCall>} toolCallMap - 工具调用映射
      * @param {ChatCompletionMessageParam[]} messages - 消息列表
@@ -1065,6 +1282,10 @@ export class MCPClient {
             toolArgs = this.ensureFilePathArg(toolName, toolArgs, toolsContent, messages);
             // 规范化读取选项，避免 head/tail 冲突
             toolArgs = this.normalizeReadOptionsArg(toolName, toolArgs);
+            // 基于实际工具 schema 做通用归一化与剔除非声明字段
+            const fullToolName = `${this.enPunycode(serverName)}__${toolName}`;
+            const wantWrite = (/write|append/i.test(toolName));
+            toolArgs = this.ensureArgsBySchema(fullToolName, toolArgs, wantWrite);
 
             const toolResult = await this.executeToolCall(session, toolName, toolArgs);
             const toolResultContent = this.processToolResult(toolResult);
@@ -1460,6 +1681,7 @@ export class MCPClient {
             this.transports.clear();
             this.sessions.clear();
             this.toolListCache = null;
+            try { this.toolsSchemaByName.clear(); } catch {}
         } catch (error) {
             logger.error("Failed to cleanup connections:", error);
             throw error;
