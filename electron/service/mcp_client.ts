@@ -9,6 +9,7 @@ import path from "path";
 import fs from "fs";
 import { logger } from "ee-core/log";
 import { mcpService } from "./mcp";
+import { MCPCompat } from "./mcp_compat";
 import Stream from "openai/streaming";
 import punycode from "punycode/";
 
@@ -40,6 +41,14 @@ export interface ServerConfig {
 }
 
 export class MCPClient {
+    constructor() {
+        // 兼容模式默认遵循环境变量，未设置时采用严格模式（strict），避免影响主聊天输出
+        try {
+            const curr = (process.env.MCP_COMPAT_MODE || '').toLowerCase();
+            const mode: 'lenient' | 'strict' = (curr === 'lenient' || curr === 'strict') ? (curr as any) : 'strict';
+            MCPCompat.configure({ mode });
+        } catch {}
+    }
     // 存储所有会话
     private sessions: Map<string, Client> = new Map();
     // 存储所有连接
@@ -53,6 +62,8 @@ export class MCPClient {
     private openai: OpenAI | null = null;
     private push: Function | null = null;
     private callback: Function | null = null;
+    private serverConfigs: Map<string, ServerConfig> = new Map();
+    private activeToolCalls: Map<string, AbortController> = new Map();
 
     /**
      * 读取 MCP 配置文件
@@ -74,13 +85,6 @@ export class MCPClient {
             }
         } catch (error) {
             logger.error('Failed to read MCP config file:', error);
-        }
-        // Excel 兜底偏好：若用户暗示 Excel，但未显式读/写意图
-        if (hintExcel) {
-            const excelDefaultRead = pickBy(e => /read/i.test(e.tool) && /excel|sheet|workbook/i.test(e.tool));
-            if (excelDefaultRead) return excelDefaultRead;
-            const anyExcel = pickBy(e => /excel|sheet|workbook/i.test(e.tool));
-            if (anyExcel) return anyExcel;
         }
         return null;
     }
@@ -237,6 +241,7 @@ export class MCPClient {
 
                 this.sessions.set(validatedConfig.name, client);
                 this.transports.set(validatedConfig.name, transport);
+                this.serverConfigs.set(validatedConfig.name, validatedConfig);
                 // 连接新服务器后，清空工具列表缓存
                 this.toolListCache = null;
             } catch (error) {
@@ -265,6 +270,115 @@ export class MCPClient {
             logger.error(`Failed to get tools for server ${serverConfig.name}:`, error);
             throw error;
         } finally {
+            this.cleanup();
+        }
+    }
+
+    /**
+     * 直接执行指定 MCP 工具（一次性调用），并返回统一结构的结果。
+     * 注意：默认遵循严格模式（strict）。如需宽松模式，请通过 opts.compatMode 指定 'lenient'。
+     */
+    public async runToolOnce(server: ServerConfig, toolName: string, toolArgs: any, opts?: { compatMode?: 'lenient' | 'strict' }): Promise<{ push: any, text?: string, raw?: any }> {
+        try {
+            // 按需切换兼容模式
+            if (opts && opts.compatMode) {
+                const mode = opts.compatMode === 'lenient' ? 'lenient' : 'strict';
+                // 优先使用 configure，避免污染全局环境
+                MCPCompat.configure({ mode });
+            }
+
+            // 连接并获取会话
+            await this.connectToServer([server]);
+            const session = this.sessions.get(server.name);
+            if (!session) {
+                throw new Error(`Session not found for server ${server.name}`);
+            }
+
+            // 首次执行工具
+            let raw: any = await (session as any).callTool({ name: toolName, arguments: toolArgs }, undefined, {
+                onprogress: (process: any) => {
+                    try {
+                        const total = Number(process?.total || 1);
+                        const progressVal = Number(process?.progress || 0);
+                        const ratio = total ? (progressVal / total) : 0;
+                        this.pushProgress('tool_call_progress', { server: server.name, tool: toolName, call_id: undefined, progress: ratio, progress_value: progressVal, total: total });
+                    } catch {}
+                }
+            });
+
+            // 针对 Claude Code 的 Write 工具要求“先 Read 再 Write”的兼容桥接：
+            // - 仅当服务器名称含 "claude"，且工具为写入类并提供了文件路径时触发
+            // - 发现错误文本中包含 “Read it first before writing” 或中文“请先读取/未读取”等提示时，自动先调用 Read 再重试 Write
+            try {
+                const isClaude = /claude/i.test(server?.name || "");
+                const isWriteLike = MCPCompat.isWriteLikeTool(toolName);
+                const filePath = (toolArgs && (toolArgs.file_path || toolArgs.path)) || "";
+                const hasPath = typeof filePath === "string" && filePath.length > 0;
+
+                const getErrorText = (): string => {
+                    let out = "";
+                    // 尝试从规范化 content 中提取文本
+                    try {
+                        const normalized = MCPCompat.normalizeContentArray(raw);
+                        out = this.extractTextFromContentJson(JSON.stringify(normalized)) || "";
+                    } catch {}
+                    // 若未获取到文本，再从原始 raw.content 提取
+                    if (!out) {
+                        try {
+                            const t = raw?.content && Array.isArray(raw.content) && raw.content[0]?.text;
+                            out = typeof t === "string" ? t : "";
+                        } catch {}
+                    }
+                    return out;
+                };
+
+                const errText = getErrorText();
+                const mentionsReadFirst = /read\s*it\s*first/i.test(errText) || /(请先读取|未读取|尚未读取)/.test(errText);
+
+                if (isClaude && isWriteLike && hasPath && (raw?.isError === true || this.isErrorText(errText)) && mentionsReadFirst) {
+                    try {
+                        // 寻找 Read 类工具名
+                        const lst = await session.listTools();
+                        const readTool = lst?.tools?.find((t: any) => /read/i.test(t?.name || ""))?.name;
+                        if (readTool) {
+                            const readArgs: any = { file_path: filePath, path: filePath };
+                            try {
+                                await session.callTool({ name: readTool, arguments: readArgs });
+                            } catch (eRead) {
+                                // 读取失败不阻断后续写入重试，仅记录日志
+                                try { logger.warn(`[MCPClient] auto-read before write failed on ${server.name}:`, eRead as any); } catch {}
+                            }
+                            // 再次尝试写入
+                            try {
+                                raw = await session.callTool({ name: toolName, arguments: toolArgs });
+                            } catch (eWrite) {
+                                // 如果重试仍失败，尝试侧写校验并返回结构化结果
+                                const coerced = MCPCompat.coerceWriteSuccess(toolName, toolArgs, (eWrite as any)?.message || errText);
+                                const pushCoerced = this.createToolResultPush(server.name, toolName, toolArgs, coerced.content);
+                                let textCoerced: string | null = null;
+                                try { textCoerced = this.extractTextFromContentJson(JSON.stringify(pushCoerced.tool_result)); } catch {}
+                                return { push: pushCoerced, text: textCoerced || undefined, raw: coerced };
+                            }
+                        }
+                    } catch (eBridge) {
+                        try { logger.warn(`[MCPClient] write->read bridge failed on ${server.name}:`, eBridge as any); } catch {}
+                    }
+                }
+            } catch {}
+
+            // 组装推送与文本
+            const push = this.createToolResultPush(server.name, toolName, toolArgs, raw);
+            let text: string | null = null;
+            try {
+                text = this.extractTextFromContentJson(JSON.stringify(push.tool_result));
+            } catch {}
+
+            return { push, text: text || undefined, raw };
+        } catch (e) {
+            logger.error(`[MCPClient] runToolOnce failed: ${toolName} on ${server?.name}`, e);
+            throw e;
+        } finally {
+            // 单次调用默认清理连接，避免资源占用
             this.cleanup();
         }
     }
@@ -299,6 +413,13 @@ export class MCPClient {
         try {
             for (const [serverName, session] of this.sessions) {
                 const response = await session.listTools();
+                // 调试：列出 claude code 的工具名与描述，便于确认是否出现 docx 相关工具
+                try {
+                    if (/claude\s*code/i.test(serverName)) {
+                        const names = response.tools.map(t => ({ name: t.name, desc: t.description }));
+                        logger.info(`[MCP Tools] ${serverName} tools: ${JSON.stringify(names)}`);
+                    }
+                } catch {}
                 const tools = response.tools.map((tool: Tool) => ({
                     type: "function" as const,
                     function: {
@@ -312,6 +433,18 @@ export class MCPClient {
                     for (const tool of response.tools) {
                         const full = `${this.enPunycode(serverName)}__${tool.name}`;
                         this.toolsSchemaByName.set(full, tool.inputSchema);
+                        // 调试：输出 claude code 的 Skill 工具 schema，便于定位参数格式
+                        try {
+                            if (/claude\s*code/i.test(serverName) && /skill/i.test(tool.name)) {
+                                logger.info(`[MCP Tools] ${serverName} Skill inputSchema: ${JSON.stringify(tool.inputSchema)}`);
+                            }
+                        } catch {}
+                        // 调试：标记 docx 相关工具
+                        try {
+                            if (/docx/i.test(tool.name) || /docx/i.test(tool.description)) {
+                                logger.info(`[MCP Tools] ${serverName} detected DOCX tool: ${tool.name} - ${tool.description}`);
+                            }
+                        } catch {}
                     }
                 } catch {}
                 availableTools.push(...tools);
@@ -333,10 +466,59 @@ export class MCPClient {
         let raw = toolResult.content;
 
         // 兼容 MCP 返回的 content 为数组或对象的情况
+        // 增强：当 content 为数组时，合并所有块中的文本/文件内容为一个纯文本（而不是仅取第一个）
+        const pickTextOrFileContent = (item: any): string | null => {
+            try {
+                if (!item || typeof item !== 'object') return null;
+                if (typeof item.text === 'string') return item.text as string;
+                if (item.file && typeof item.file === 'object' && typeof item.file.content === 'string') {
+                    return item.file.content as string;
+                }
+                if (item.type === 'json' && item.json && typeof item.json === 'object') {
+                    const j = item.json as any;
+                    if (typeof j.text === 'string') return j.text as string;
+                    if (j.file && typeof j.file === 'object' && typeof j.file.content === 'string') return j.file.content as string;
+                    if (typeof j.content === 'string') return j.content as string;
+                    // 兼容 Claude Code：当返回包含 available_skills 时，转为可读文本
+                    try {
+                        const skills = j.available_skills;
+                        if (Array.isArray(skills) && skills.length > 0) {
+                            const lines = skills.map((s: any) => {
+                                const name = (s && (s.name || s.title || s.id)) ? String(s.name || s.title || s.id) : '';
+                                const desc = (s && s.description) ? String(s.description) : '';
+                                const loc = (s && s.location) ? String(s.location) : '';
+                                const extra = [desc, loc].filter(Boolean).join(' | ');
+                                return extra ? `- ${name}: ${extra}` : `- ${name}`;
+                            }).join('\n');
+                            return `Available skills (Claude Code):\n${lines}`;
+                        }
+                    } catch { /* ignore */ }
+                    // 兜底：无显式文本字段但可序列化时，返回紧凑 JSON 字符串
+                    try {
+                        const compact = JSON.stringify(j);
+                        if (compact && compact.length > 0) return compact;
+                    } catch { /* ignore */ }
+                }
+                if (item.data && typeof item.data === 'object' && item.data.file && typeof item.data.file === 'object' && typeof item.data.file.content === 'string') {
+                    return item.data.file.content as string;
+                }
+                return null;
+            } catch { return null; }
+        };
         if (Array.isArray(raw)) {
-            const first = raw[0];
-            if (first && typeof first === 'object' && 'text' in first && typeof first.text === 'string') {
-                raw = first.text;
+            const parts: string[] = [];
+            for (const it of raw) {
+                const t = pickTextOrFileContent(it);
+                if (typeof t === 'string' && t.trim().length > 0) parts.push(t);
+            }
+            const merged = parts.join('\n\n');
+            if (merged.trim().length > 0) {
+                raw = merged;
+            } else {
+                const first = raw[0];
+                if (first && typeof first === 'object' && 'text' in first && typeof first.text === 'string') {
+                    raw = first.text;
+                }
             }
         } else if (raw && typeof raw === 'object' && 'text' in raw && typeof raw.text === 'string') {
             raw = raw.text;
@@ -364,14 +546,68 @@ export class MCPClient {
             return JSON.stringify([{ type: 'text', text }]);
         }
 
-        // 若解析成功但非 Excel 结构，则原样返回结构化 JSON 字符串
+        // claude-code 等工具的文件读取结果归一化：优先提取 file.content 为纯文本
+        const tryExtractFileContent = (obj: any): string | null => {
+            try {
+                if (!obj || typeof obj !== 'object') return null;
+                // 顶层 file.content
+                if (obj.file && typeof obj.file === 'object' && typeof obj.file.content === 'string') {
+                    return obj.file.content as string;
+                }
+                // 顶层 data.file.content
+                if (obj.data && typeof obj.data === 'object' && obj.data.file && typeof obj.data.file === 'object' && typeof obj.data.file.content === 'string') {
+                    return obj.data.file.content as string;
+                }
+                // json 包裹：{ type: 'json', json: { file: { content } } }
+                if (obj.type === 'json' && obj.json && typeof obj.json === 'object') {
+                    const j = obj.json as any;
+                    if (j.file && typeof j.file === 'object' && typeof j.file.content === 'string') {
+                        return j.file.content as string;
+                    }
+                    if (typeof j.content === 'string') {
+                        return j.content as string;
+                    }
+                }
+                return null;
+            } catch { return null; }
+        };
+        if (parsed) {
+            if (Array.isArray(parsed)) {
+                // 在数组中合并所有包含 text 或 file.content 的项
+                const texts: string[] = [];
+                for (let i = 0; i < parsed.length; i++) {
+                    const it = parsed[i];
+                    if (it && typeof it === 'object' && typeof it.text === 'string') {
+                        texts.push(it.text);
+                        continue;
+                    }
+                    const fc = tryExtractFileContent(it);
+                    if (typeof fc === 'string') texts.push(fc);
+                }
+                if (texts.length > 0) {
+                    const merged = texts.join('\n\n');
+                    return JSON.stringify([{ type: 'text', text: merged }]);
+                }
+            } else if (typeof parsed === 'object') {
+                // 单对象：尝试从 file.content 提取
+                if (typeof (parsed as any).text === 'string') {
+                    return JSON.stringify([{ type: 'text', text: (parsed as any).text }]);
+                }
+                const fc = tryExtractFileContent(parsed);
+                if (typeof fc === 'string') {
+                    return JSON.stringify([{ type: 'text', text: fc }]);
+                }
+            }
+        }
+
+        // 若解析成功但非 Excel/文件结构，则原样返回结构化 JSON 字符串
         if (parsed !== null && typeof parsed !== 'undefined') {
             return JSON.stringify(parsed);
         }
 
-        // 二进制内容阻断：提示使用 Excel 相关工具
+        // 二进制内容阻断：提示使用合适的工具（不再只引导 Excel）
         if (typeof raw === 'string' && this.isLikelyBinaryText(raw)) {
-            const msg = "检测到可能的二进制内容（例如 Excel 工作簿或压缩包）。请使用 Excel 相关 MCP 工具读取，如 `excel-mcp-server__read_data_from_excel`。";
+            const msg = "检测到可能的二进制内容（例如 Excel 工作簿、Word 文档或压缩包）。请使用适配该文件类型的 MCP 工具：例如 .xlsx/.xls 使用 Excel 读取工具；.docx 使用具备 docx 能力的工具；若不确定，请直接描述你的需求，我会自动选择合适的工具。";
             return JSON.stringify([{ type: 'text', text: msg }]);
         }
 
@@ -386,6 +622,125 @@ export class MCPClient {
 
         // 兜底：序列化原始内容
         return JSON.stringify(toolResult.content);
+    }
+
+    /**
+     * 从工具结果的 JSON 字符串中提取纯文本（若存在）
+     */
+    private extractTextFromContentJson(jsonStr: string): string | null {
+        try {
+            const obj = JSON.parse((jsonStr || '').toString());
+            const pickTextFromObj = (o: any): string | null => {
+                if (!o || typeof o !== 'object') return null;
+                if (typeof o.text === 'string') return o.text as string;
+                // 提取 file.content
+                if (o.file && typeof o.file === 'object' && typeof o.file.content === 'string') return o.file.content as string;
+                // json 包裹
+                if (o.type === 'json' && o.json && typeof o.json === 'object') {
+                    const j = o.json as any;
+                    if (typeof j.text === 'string') return j.text as string;
+                    if (j.file && typeof j.file === 'object' && typeof j.file.content === 'string') return j.file.content as string;
+                    if (typeof j.content === 'string') return j.content as string;
+                    // 兼容 Claude Code Skill：available_skills 列表转为文本
+                    try {
+                        const skills = j.available_skills;
+                        if (Array.isArray(skills) && skills.length > 0) {
+                            const lines = skills.map((s: any) => {
+                                const name = (s && (s.name || s.title || s.id)) ? String(s.name || s.title || s.id) : '';
+                                const desc = (s && s.description) ? String(s.description) : '';
+                                const loc = (s && s.location) ? String(s.location) : '';
+                                const extra = [desc, loc].filter(Boolean).join(' | ');
+                                return extra ? `- ${name}: ${extra}` : `- ${name}`;
+                            }).join('\n');
+                            return `Available skills (Claude Code):\n${lines}`;
+                        }
+                    } catch { /* ignore */ }
+                }
+                // data.file.content
+                if (o.data && typeof o.data === 'object' && o.data.file && typeof o.data.file === 'object' && typeof o.data.file.content === 'string') return o.data.file.content as string;
+                return null;
+            };
+
+            if (Array.isArray(obj) && obj.length > 0) {
+                // 增强：合并所有块中的文本/文件内容为一个纯文本返回
+                const parts: string[] = [];
+                for (let i = 0; i < obj.length; i++) {
+                    const t = pickTextFromObj(obj[i]);
+                    if (typeof t === 'string' && t.trim().length > 0) parts.push(t);
+                }
+                if (parts.length > 0) return parts.join('\n\n');
+            } else if (obj && typeof obj === 'object') {
+                const t = pickTextFromObj(obj);
+                if (typeof t === 'string') return t;
+            }
+        } catch { /* ignore */ }
+        return null;
+    }
+
+    /**
+     * 简易错误文本判定（中英文常见错误关键词）
+     */
+    private isErrorText(text: string | null | undefined): boolean {
+        const t = (text || '').toLowerCase();
+        if (!t) return false;
+        const patterns = [
+            'error', 'failed', 'invalid', 'not allowed', 'permission', 'does not exist', 'not found', 'did you mean',
+            '错误', '失败', '无权限', '不存在', '未找到', '非法', '无效'
+        ];
+        return patterns.some(p => t.includes(p));
+    }
+
+    /**
+     * 识别“docx/Word 创建写入”相关的错误提示，用于触发跨服务器技能桥接。
+     * 场景：claude-code 等工具返回“只能创建纯文本/无法创建 docx/请使用 docx 技能/无法读取二进制 docx”等提示。
+     */
+    private isDocxSkillHint(text: string | null | undefined): boolean {
+        const t = (text || '').toLowerCase();
+        if (!t) return false;
+        const hints = [
+            // 通用 docx/word 关键词
+            'docx', 'word', 'word 文档', 'docx 技能', '使用 docx 技能', 'use docx skill', 'docx tool',
+            // 写入/创建相关
+            '无法创建 docx', '不能创建 docx', '只能创建纯文本', 'create docx', 'write docx',
+            // 读取相关（优先引导到专用读取工具）
+            '读取 docx', '读取docx', 'read docx', 'open docx', 'extract docx', 'docx 内容', 'docx text',
+            // 二进制读取失败的提示（来自 Read 工具）
+            'cannot read binary', 'binary .docx file', 'cannot read binary files'
+        ];
+        return hints.some(h => t.includes(h));
+    }
+
+    /**
+     * 针对 content 数组（包含 json/text/file 等项）更严格地识别错误或未验证成功
+     * 规则：
+     * - 若存在 json 项且 status 为 error 或 unknown，视为错误（或至少不应宣称成功）
+     * - 若存在 json 项且 verified 为 false，视为错误
+     */
+    private isErrorContentArray(content: any): boolean {
+        try {
+            const arr = Array.isArray(content) ? content : [];
+            for (const it of arr) {
+                if (it && it.type === 'json' && it.json && typeof it.json === 'object') {
+                    const st = String((it.json as any).status || '').toLowerCase();
+                    const v = (it.json as any).verified;
+                    if (st === 'error' || st === 'unknown') return true;
+                    if (v === false) return true;
+                }
+            }
+            return false;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * 是否在首个成功结果后直接停止循环（例如“只返回内容”）
+     */
+    private shouldStopOnFirstSuccess(messages: ChatCompletionMessageParam[]): boolean {
+        const lastUser = this.getLastUserText(messages) || '';
+        const t = lastUser.toLowerCase();
+        const keys = ['只返回内容', '仅返回内容', '只输出内容', '仅输出内容', 'only return content'];
+        return keys.some(k => t.includes(k));
     }
 
     /**
@@ -998,6 +1353,20 @@ export class MCPClient {
                 finalPath = this.joinDirAndFile(sanitized, filenameCandidate);
             }
 
+            // 针对常见文件扩展名，裁切掉跟随的中文标点或说明性文本（例如 “，内容为：...”）
+            try {
+                const commonExtPattern = /(\.(txt|md|json|csv|log|ini|conf|xml|yml|yaml|html|htm|js|ts))/i;
+                const m = finalPath.match(commonExtPattern);
+                if (m) {
+                    const idx = finalPath.indexOf(m[0]);
+                    if (idx >= 0) {
+                        finalPath = finalPath.slice(0, idx + m[0].length);
+                    }
+                }
+                // 去除末尾的引号与标点
+                finalPath = finalPath.replace(/[‘’“”"'\s，。；、：]+$/g, '');
+            } catch {}
+
             // 同步设置 file_path 与 path，确保兼容不同服务器的参数命名
             toolArgs.file_path = finalPath;
             toolArgs.path = finalPath;
@@ -1017,6 +1386,44 @@ export class MCPClient {
         } catch {}
 
         return toolArgs;
+    }
+
+    /**
+     * 从工具参数或上下文中提取 docx 目标路径与写入内容
+     */
+    private extractDocxPathAndContent(toolArgs: any, toolsContent: string, messages: ChatCompletionMessageParam[]): { path?: string, content?: string } {
+        let candidatePath: string | undefined;
+        // 1) 参数内路径
+        const provided = toolArgs?.file_path || toolArgs?.filepath || toolArgs?.path || toolArgs?.file || toolArgs?.filename;
+        if (typeof provided === 'string') {
+            const p = this.sanitizeFilePathV2(provided, provided);
+            candidatePath = p;
+        }
+        // 2) 工具内容/用户消息提取路径
+        if (!candidatePath) {
+            let c = this.extractWindowsPath(toolsContent);
+            if (!c) {
+                const lastText = this.getLastUserText(messages);
+                c = this.extractWindowsPath(lastText || '') || null;
+            }
+            if (c) candidatePath = this.sanitizeFilePathV2(c, c);
+        }
+        // 若不是 .docx，忽略
+        if (candidatePath && !/\.docx$/i.test(candidatePath)) {
+            candidatePath = undefined;
+        }
+        // 写入内容候选
+        let content: string | undefined;
+        if (typeof toolArgs?.content === 'string') content = toolArgs.content;
+        else if (typeof toolArgs?.text === 'string') content = toolArgs.text;
+        else if (typeof toolArgs?.data === 'string') content = toolArgs.data;
+        // 若参数缺失，尝试从用户消息中提取“内容是 …”的片段（简单中文规则）
+        if (!content) {
+            const last = this.getLastUserText(messages) || '';
+            const m = last.match(/内容\s*是\s*[“"']([^“"']+)[”"']/);
+            if (m && m[1]) content = m[1].trim();
+        }
+        return { path: candidatePath, content };
     }
 
     /**
@@ -1047,6 +1454,214 @@ export class MCPClient {
         }
 
         return toolArgs;
+    }
+
+    /**
+     * 针对 Claude Code 的 Skill 工具参数进行专门规范化：
+     * - 仅当 serverName 含有 "claude code" 且 toolName 含有 "Skill" 时生效
+     * - 接受多种别名字段：skill、skill_name、name、cmd、command、action、mode、operation
+     * - 当传入对象或数组时，优先提取其中的 name 或第一个元素为技能名
+     * - 若未能确定技能名，则根据最近用户消息进行语义线索提取（如 PDF/Excel/Word/Git/视频/Canvas）
+     * - 移除 schema 未声明的额外字段（args/arguments/params/parameters/options/opts/data 等），避免服务器报错
+     */
+    private ensureClaudeSkillArg(serverName: string, toolName: string, toolArgs: any, messages: ChatCompletionMessageParam[]): any {
+        try {
+            if (!/claude\s*code/i.test(serverName)) return toolArgs;
+            if (!/skill/i.test(toolName)) return toolArgs;
+            const argsObj: any = (toolArgs && typeof toolArgs === 'object') ? { ...toolArgs } : {};
+
+            // 统一获取技能名（支持别名），并兼容直接将整个 arguments 写成字符串的情况（例如 "pdf"）
+            let skillRaw: any = (typeof toolArgs === 'string') ? toolArgs : (argsObj.skill ?? argsObj.skill_name ?? argsObj.name ?? argsObj.cmd ?? argsObj.command ?? argsObj.action ?? argsObj.mode ?? argsObj.operation);
+            // 若为对象或数组，尝试提取 name 或第一个元素
+            if (skillRaw && typeof skillRaw === 'object') {
+                try {
+                    if (Array.isArray(skillRaw)) {
+                        skillRaw = skillRaw.length > 0 ? skillRaw[0] : '';
+                    }
+                    if (skillRaw && typeof skillRaw === 'object') {
+                        if (typeof (skillRaw as any).name === 'string') {
+                            skillRaw = (skillRaw as any).name;
+                        } else if (typeof (skillRaw as any).id === 'string') {
+                            skillRaw = (skillRaw as any).id;
+                        } else {
+                            // 兜底：字符串化但避免 "[object Object]"
+                            const keys = Object.keys(skillRaw);
+                            if (keys.length === 1 && typeof (skillRaw as any)[keys[0]] === 'string') {
+                                skillRaw = (skillRaw as any)[keys[0]];
+                            } else {
+                                skillRaw = '';
+                            }
+                        }
+                    }
+                } catch { skillRaw = ''; }
+            }
+
+            // 若仍未得到字符串技能名，根据上下文猜测
+            if (typeof skillRaw !== 'string' || !skillRaw.trim()) {
+                const last = this.getLastUserText(messages) || '';
+                const lower = last.toLowerCase();
+                // 文件扩展名线索
+                const pathInText = this.extractWindowsPath(last) || '';
+                let guess = '';
+                if (/\.xlsx?$/i.test(pathInText) || /(excel|xlsx|workbook|sheet)/i.test(lower)) {
+                    guess = 'xlsx';
+                } else if (/\.pdf$/i.test(pathInText) || /pdf/i.test(lower)) {
+                    guess = 'pdf';
+                } else if (/\.docx$/i.test(pathInText) || /(word|docx)/i.test(lower)) {
+                    guess = 'docx';
+                } else if (/git/i.test(lower)) {
+                    guess = 'git-pushing';
+                } else if (/(video|下载|download)/i.test(lower)) {
+                    guess = 'video-downloader';
+                } else if (/(canvas|设计|design)/i.test(lower)) {
+                    guess = 'canvas-design';
+                }
+                if (guess) skillRaw = guess;
+            }
+
+            if (typeof skillRaw === 'string') {
+                // 同义词与中文别称归一化
+                const normalizeSkill = (s: string): string => {
+                    const raw = (s || '').trim();
+                    const lower = raw.toLowerCase();
+                    // 列出技能相关（中英文）统一为 list
+                    if (/^(list|list_skills|show_skills|skills|skill_list)$/.test(lower)) return 'list';
+                    if (/列出技能|技能列表|查看技能|显示技能/.test(raw)) return 'list';
+                    if (/^excel$/.test(lower)) return 'xlsx';
+                    if (/^(xlsx|sheet|workbook)$/.test(lower)) return 'xlsx';
+                    if (/^word$/.test(lower)) return 'docx';
+                    if (/^(doc|docx)$/.test(lower)) return 'docx';
+                    if (/^pdf$/.test(lower) || /(pdf阅读|read_pdf|pdf_parser)/.test(lower)) return 'pdf';
+                    if (/git.*push/.test(lower)) return 'git-pushing';
+                    if (/video|downloader|下载视频/.test(lower)) return 'video-downloader';
+                    if (/canvas|design|设计/.test(lower)) return 'canvas-design';
+                    return raw;
+                };
+                argsObj.skill = normalizeSkill(skillRaw);
+            }
+
+            // 移除未在 schema 中声明且常导致报错的字段
+            delete argsObj.args;
+            delete argsObj.arguments;
+            delete argsObj.params;
+            delete argsObj.parameters;
+            delete argsObj.options;
+            delete argsObj.opts;
+            delete argsObj.data;
+            delete argsObj.skill_name;
+            delete argsObj.name;
+            delete argsObj.cmd;
+            delete argsObj.command;
+            delete argsObj.action;
+            delete argsObj.mode;
+            delete argsObj.operation;
+
+            try {
+                const dbg = (typeof toolArgs === 'string') ? `stringArg=${JSON.stringify(toolArgs)}` : `rawArgs=${JSON.stringify(toolArgs)}`;
+                logger.info(`[MCP ClaudeSkill] normalized args for ${serverName}__${toolName}: ${JSON.stringify(argsObj)}; ${dbg}`);
+            } catch {}
+            return argsObj;
+        } catch (e) {
+            try { logger.warn(`[MCP ClaudeSkill] ensure args failed for ${serverName}__${toolName}:`, e as any); } catch {}
+            return toolArgs;
+        }
+    }
+
+    /**
+     * 通用路径参数归一化（适配所有带路径字段的工具，不限 FileSystem）
+     * - 基于工具 schema 判断是否存在路径/目录相关字段
+     * - 从工具内容与最近用户消息中提取 Windows 绝对路径，进行清理并填充
+     * - 若提取到的是目录且存在文件名候选，则拼接为完整路径
+     * - 不会覆盖已存在且有效的路径字段（仅在缺失或看似目录时进行修正）
+     */
+    private ensureGenericPathArg(fullToolName: string, toolName: string, toolArgs: any, toolsContent: string, messages: ChatCompletionMessageParam[]): any {
+        try {
+            const schema = this.toolsSchemaByName.get(fullToolName);
+            // 若无 schema，尝试基于现有参数猜测
+            const properties: Record<string, any> = (schema && schema.properties) ? schema.properties : {};
+
+            // 判断是否为“有路径字段”的工具
+            const hasPathFieldInSchema = ['file_path','filepath','path','file','filename'].some(k => Object.prototype.hasOwnProperty.call(properties, k));
+            const hasDirFieldInSchema = ['directory_path','dir_path','directory','dir','folder'].some(k => Object.prototype.hasOwnProperty.call(properties, k));
+            const looksPathyArgs = toolArgs && (toolArgs.file_path || toolArgs.filepath || toolArgs.path || toolArgs.file || toolArgs.filename);
+            const looksDirArgs = toolArgs && (toolArgs.directory_path || toolArgs.dir_path || toolArgs.directory || toolArgs.dir || toolArgs.folder);
+            if (!hasPathFieldInSchema && !hasDirFieldInSchema && !looksPathyArgs && !looksDirArgs) return toolArgs;
+
+            // 从上下文提取候选绝对路径
+            let candidate: string | null = null;
+            if (toolsContent) candidate = this.extractWindowsPath(toolsContent);
+            if (!candidate) {
+                const lastText = this.getLastUserText(messages);
+                if (lastText) candidate = this.extractWindowsPath(lastText);
+            }
+
+            // 现有参数中的路径值（别名接受）
+            const provided = toolArgs?.file_path || toolArgs?.filepath || toolArgs?.path || toolArgs?.file || toolArgs?.filename;
+            let sanitized: string | undefined;
+            if (!provided && candidate) {
+                sanitized = this.sanitizeFilePathV2(candidate || '', candidate || undefined);
+            } else if (provided && typeof provided === 'string') {
+                sanitized = this.sanitizeFilePathV2(provided, candidate || undefined);
+            }
+
+            if (sanitized) {
+                let finalPath = sanitized;
+                const dirLike = this.isDirectoryLikePath(sanitized);
+
+                // 文件名候选（来自参数或上下文）
+                let filenameCandidate: string | null = null;
+                if (typeof toolArgs.filename === 'string') {
+                    filenameCandidate = this.extractFileNameCandidate(toolArgs.filename);
+                } else if (typeof toolArgs.file === 'string') {
+                    if (!/^[A-Za-z]:\\/.test(toolArgs.file)) {
+                        filenameCandidate = this.extractFileNameCandidate(toolArgs.file);
+                    }
+                }
+                if (!filenameCandidate) {
+                    filenameCandidate = this.extractFileNameCandidate(toolsContent);
+                }
+                if (!filenameCandidate) {
+                    const lastText = this.getLastUserText(messages);
+                    if (lastText) filenameCandidate = this.extractFileNameCandidate(lastText);
+                }
+
+                if (dirLike && filenameCandidate) {
+                    finalPath = this.joinDirAndFile(sanitized, filenameCandidate);
+                }
+
+                // 针对常见扩展名，裁切掉扩展名之后的中文说明或标点，避免污染路径
+                try {
+                    const commonExtPattern = /(\.(txt|md|json|csv|log|ini|conf|xml|yml|yaml|html|htm|js|ts|docx|doc|pdf|xls|xlsx|xlsm))/i;
+                    const m = finalPath.match(commonExtPattern);
+                    if (m) {
+                        const idx = finalPath.indexOf(m[0]);
+                        if (idx >= 0) {
+                            finalPath = finalPath.slice(0, idx + m[0].length);
+                        }
+                    }
+                    finalPath = finalPath.replace(/[‘’“”"'\s，。；、：]+$/g, '');
+                } catch {}
+
+                // 写入到最合适的字段：优先 file_path -> path -> file
+                if (!toolArgs.file_path && Object.prototype.hasOwnProperty.call(properties, 'file_path')) {
+                    toolArgs.file_path = finalPath;
+                } else if (!toolArgs.path && Object.prototype.hasOwnProperty.call(properties, 'path')) {
+                    toolArgs.path = finalPath;
+                } else if (!toolArgs.file && Object.prototype.hasOwnProperty.call(properties, 'file')) {
+                    toolArgs.file = finalPath;
+                } else if (!toolArgs.filename && Object.prototype.hasOwnProperty.call(properties, 'filename')) {
+                    toolArgs.filename = finalPath;
+                } else {
+                    // 无 schema 或无法判断时，保守写入 file_path 字段
+                    if (!toolArgs.file_path) toolArgs.file_path = finalPath;
+                }
+            }
+
+            return toolArgs;
+        } catch (e) {
+            try { logger.warn(`[MCP GenericPath] failed for ${fullToolName}:`, e as any); } catch {}
+            return toolArgs;
+        }
     }
 
     /**
@@ -1082,6 +1697,10 @@ export class MCPClient {
                 ['sheet_name','sheet','worksheet'],
                 // 写入内容
                 ['content','text','data','body','payload'],
+                // Skill 工具常见参数：技能名/命令
+                ['skill','cmd','command','action','mode','operation','skill_name','name'],
+                // Skill 工具常见参数：技能参数对象
+                ['args','arguments','params','parameters','options','opts','data'],
                 // 编码
                 ['encoding','charset'],
                 // HTTP/网络常见参数
@@ -1271,18 +1890,43 @@ export class MCPClient {
             }
             let [serverName, toolName] = toolCall.function.name.split('__');
             serverName = this.dePunycode(serverName);
-            const session = this.sessions.get(serverName);
+            let session = this.sessions.get(serverName);
+
+            // 容错：若无法找到会话，尝试按工具短名重映射到真实服务器
+            if (!session && toolName) {
+                try {
+                    const matchedFull = [...this.toolsSchemaByName.keys()].find(full => full.endsWith(`__${toolName}`));
+                    if (matchedFull) {
+                        const recoveredServer = this.dePunycode(matchedFull.split('__')[0] || '');
+                        const recovered = this.sessions.get(recoveredServer);
+                        if (recovered) {
+                            session = recovered;
+                            try { logger.warn(`[MCP Tool] remapped invalid server name "${toolCall.function.name}" -> "${this.enPunycode(recoveredServer)}__${toolName}"`); } catch {}
+                        }
+                    }
+                } catch {}
+            }
 
             if (!session) {
                 continue;
             }
             let toolArgs: any = {};
+            // 原始参数字符串（可能包含 Windows 路径等需要转义的内容）
+            const rawArgStr = (toolCall.function && typeof toolCall.function.arguments === 'string') ? toolCall.function.arguments : '';
             try {
-                toolArgs = JSON.parse(toolCall.function.arguments);
+                toolArgs = JSON.parse(rawArgStr);
             } catch (e) {
-                logger.error(`Failed to parse tool arguments for ${toolName}:`, e);
-                // 尝试容错：继续执行但以空对象为参数
-                toolArgs = {};
+                // 第一次解析失败，尝试自动修复常见问题：
+                // 1）Windows 路径中的反斜杠未转义导致 JSON 无法解析
+                // 2）路径值后混入中文说明/标点
+                let fixed = this.repairJsonArguments(rawArgStr);
+                try {
+                    toolArgs = JSON.parse(fixed);
+                } catch (e2) {
+                    logger.error(`Failed to parse tool arguments for ${toolName} after repair:`, e2);
+                    // 容错：继续执行但以空对象为参数
+                    toolArgs = {};
+                }
             }
 
             // 先纠正 Excel 工具的 filename 绝对路径
@@ -1293,38 +1937,304 @@ export class MCPClient {
             toolArgs = this.normalizeReadOptionsArg(toolName, toolArgs);
             // 基于实际工具 schema 做通用归一化与剔除非声明字段
             const fullToolName = `${this.enPunycode(serverName)}__${toolName}`;
-            const wantWrite = (/write|append/i.test(toolName));
+            const wantWrite = MCPCompat.isWriteLikeTool(toolName);
+            // 新增：通用路径归一化，适配非 FileSystem 工具（如 claude-code 的 Read/Write）
+            toolArgs = this.ensureGenericPathArg(fullToolName, toolName, toolArgs, toolsContent, messages);
+            // 新增：Claude Code Skill 参数矫正（在按 schema 归一化之前执行，确保 skill 为字符串且移除多余字段）
+            toolArgs = this.ensureClaudeSkillArg(serverName, toolName, toolArgs, messages);
             toolArgs = this.ensureArgsBySchema(fullToolName, toolArgs, wantWrite);
 
+            // Claude Code Skill 防御：若仍缺失或为空字符串，则不实际调用该工具，改为给出提示消息，避免服务器报错
+            if (/claude\s*code/i.test(serverName) && /skill/i.test(toolName)) {
+                const s = (toolArgs && typeof toolArgs.skill === 'string') ? toolArgs.skill.trim() : '';
+                if (!s) {
+                    try { logger.warn(`[MCP ClaudeSkill] missing skill, skip tool call for ${serverName}__${toolName}`); } catch {}
+                    const guidance = [
+                        '未能确定要调用的 Claude Code 技能（skill）名称。',
+                        '请在后续消息中仅提供一个技能名字符串（例如：pdf、xlsx、docx、git-pushing、video-downloader、canvas-design），不要包含对象或其他字段。',
+                        '如果需要查看有哪些技能，可回复“列出技能”。'
+                    ].join('\n');
+                    // 将提示作为工具结果返回到消息流，促使大模型修正下一次的工具调用
+                    messages = this.updateMessages(messages, toolCall, toolsContent, guidance);
+                    continue;
+                }
+                // 特例：拦截 skill='list'，以及 LM 常用的 '/help'/'help' 别名，直接返回可用技能的结构化列表，避免服务端未知技能或 400 报错
+                const sNorm = s.toLowerCase();
+                if (sNorm === 'list' || sNorm === 'help' || sNorm === '/help') {
+                    try {
+                        try { logger.info(`[MCP ClaudeSkill] intercept skills listing via skill="${s}" -> return available_skills locally`); } catch {}
+                        const available = [
+                            { name: 'pdf', description: '读取/解析 PDF 文件' },
+                            { name: 'xlsx', description: '读取或写入 Excel 工作簿' },
+                            { name: 'docx', description: '读取或写入 Word 文档' },
+                            { name: 'git-pushing', description: '推送 Git 变更（凭证配置后）' },
+                            { name: 'video-downloader', description: '下载视频（需提供可下载链接或页面）' },
+                            { name: 'canvas-design', description: '画布/设计相关操作' }
+                        ];
+                        const toolResultArray = MCPCompat.normalizeContentArray([{ type: 'json', json: { status: 'success', available_skills: available } }]);
+                        const toolResultLocal: MCPToolResult = { content: toolResultArray };
+                        // 进度：开始/完成
+                        try {
+                            this.pushProgress('tool_call_started', { server: serverName, tool: toolName, args: toolArgs, call_id: toolCall.id });
+                        } catch {}
+                        try {
+                            this.pushProgress('tool_call_finished', { server: serverName, tool: toolName, args: toolArgs, status: 'success', call_id: toolCall.id });
+                        } catch {}
+                        // 推送原始数组，更新消息（使用可读文本）
+                        try {
+                            const toolResultPush = this.createToolResultPush(serverName, toolName, toolArgs, toolResultLocal.content);
+                            this.pushMessage(toolResultPush);
+                        } catch {}
+                        const toolResultContent = this.processToolResult(toolResultLocal);
+                        messages = this.updateMessages(messages, toolCall, toolsContent, toolResultContent);
+                        continue;
+                    } catch (e) {
+                        try { logger.warn(`[MCP ClaudeSkill] list intercept failed:`, e as any); } catch {}
+                    }
+                }
+            }
+
+            // 写入型工具：在调用前确保父目录存在（宽松模式下自动创建）
+            if (wantWrite && toolArgs && typeof toolArgs === 'object') {
+                const p = toolArgs.file_path || toolArgs.path;
+                if (typeof p === 'string' && p) {
+                    MCPCompat.fsEnsureParentDir(p);
+                }
+            }
+
             let toolResult: MCPToolResult;
+            // 进度：准备调用工具
             try {
-                toolResult = await this.executeToolCall(session, toolName, toolArgs);
+                this.pushProgress('tool_call_started', {
+                    server: serverName,
+                    tool: toolName,
+                    args: toolArgs,
+                    call_id: toolCall.id
+                });
+            } catch {}
+            try {
+                toolResult = await this.executeToolCall(session, serverName, toolName, toolArgs, toolCall.id);
             } catch (err: any) {
                 // Excel 专用容错：工作表未找到时回退为 Sheet1 再重试一次
-                const isExcelTool = /excel|sheet|workbook/i.test(toolName) || toolName === 'read_data_from_excel';
+                const isExcelTool = MCPCompat.isExcelTool(toolName);
                 const msg = (err && (err.message || err.toString())) || '';
-                const sheetNotFound = /sheet|worksheet/i.test(msg) && /(not\s*found|不存在|no\s*such|missing)/i.test(msg);
+                const sheetNotFound = MCPCompat.excelShouldRetrySheetNotFound(msg);
                 if (isExcelTool && sheetNotFound) {
                     try {
                         const before = toolArgs.sheet_name || toolArgs.sheet || toolArgs.worksheet || '';
-                        toolArgs.sheet_name = 'Sheet1';
-                        delete toolArgs.sheet; delete toolArgs.worksheet;
-                        logger.warn(`[MCP Excel] sheet not found: "${before}", fallback to "Sheet1" and retry`);
+                        toolArgs = MCPCompat.excelFallbackArgsOnSheetNotFound(toolArgs);
+                        logger.warn(`[MCP Excel] sheet not found: "${before}", fallback and retry`);
                         toolResult = await this.executeToolCall(session, toolName, toolArgs);
                     } catch (err2) {
                         logger.error(`[MCP Excel] retry with Sheet1 failed for ${toolName}:`, err2);
                         throw err2;
                     }
+                } else if (MCPCompat.isWriteLikeTool(toolName) && MCPCompat.isSchemaMismatch(msg)) {
+                    // 兼容：工具声明输出 schema，但返回非结构化文本。写入类工具在本地侧写成功时，强制构造结构化 JSON。
+                    try {
+                        const coerced = MCPCompat.coerceWriteSuccess(toolName, toolArgs, msg);
+                        toolResult = coerced as unknown as MCPToolResult;
+                    } catch (coerceErr) {
+                        try { logger.error(`[MCPCompat] failed to coerce structured result for ${toolName}:`, coerceErr as any); } catch {}
+                        throw err;
+                    }
+                } else if (/claude\s*code/i.test(serverName) && /skill/i.test(toolName) && MCPCompat.isSchemaMismatch(msg)) {
+                    // Claude Code Skill：当服务端声明了 output_schema 但返回纯文本导致 -32600，降级为文本结果，避免中断。
+                    try {
+                        const friendly = [
+                            '提示：Claude Code 的 Skill 工具本次返回的是纯文本，但服务端标注了结构化输出，导致 -32600 错误。',
+                            'AingDesk 已自动将其降级为文本模式以继续会话。',
+                            '如需结构化 JSON，请在指令中明确要求“仅返回 JSON”。'
+                        ].join('\n');
+                        const contentArray = MCPCompat.normalizeContentArray([{ type: 'text', text: friendly }]);
+                        toolResult = { content: contentArray } as MCPToolResult;
+                        try { logger.warn(`[MCPCompat] downgraded Claude Skill result to text due to schema mismatch: ${msg}`); } catch {}
+                    } catch (wrapErr) {
+                        throw err;
+                    }
+                } else if (/claude\s*code/i.test(serverName) && /skill/i.test(toolName) && /unknown\s*skill/i.test(msg.toLowerCase())) {
+                    // Claude Code Skill：未知技能名时，返回中文引导，提示仅返回英文技能名字符串
+                    try {
+                        const guidance = [
+                            '未识别的 Claude Code 技能名。',
+                            '请仅返回一个有效技能的英文名字符串，例如：pdf、xlsx、docx、list（列出技能）、git-pushing、video-downloader、canvas-design。',
+                            '不要包含对象或其他字段。'
+                        ].join('\n');
+                        // 调整顺序：先推送中文引导，再附加原始错误结构，便于前端优先展示中文提示
+                        const contentArray = MCPCompat.normalizeContentArray([{ type: 'text', text: guidance }, { type: 'json', json: { status: 'error', message: msg } }]);
+                        toolResult = { content: contentArray } as MCPToolResult;
+                        try { logger.warn(`[MCP ClaudeSkill] unknown skill: ${msg}`); } catch {}
+                    } catch (wrapErr) {
+                        // 若结构化失败，保持原始异常行为
+                        throw err;
+                    }
                 } else {
-                    throw err;
+                    // 通用错误结构化：将错误包装为 JSON，以便前端一致渲染
+                    try {
+                        const contentArray = MCPCompat.normalizeContentArray([
+                            { type: 'json', json: { status: 'error', message: msg } },
+                        ]);
+                        toolResult = { content: contentArray } as MCPToolResult;
+                        try { logger.info(`[MCPCompat] structured error for ${toolName}: ${msg}`); } catch {}
+                    } catch (wrapErr) {
+                        // 若结构化失败，保持原始异常行为
+                        throw err;
+                    }
                 }
             }
             const toolResultContent = this.processToolResult(toolResult);
+            const textForJudge = this.extractTextFromContentJson(toolResultContent);
+            const isErr = this.isErrorText(textForJudge) || this.isErrorContentArray((toolResult as any)?.content);
 
-            const toolResultPush = this.createToolResultPush(serverName, toolName, toolArgs, toolResultContent);
-            this.pushMessage(toolResultPush);
+            // 进度：工具调用完成（成功/失败）
+            try {
+                this.pushProgress('tool_call_finished', {
+                    server: serverName,
+                    tool: toolName,
+                    args: toolArgs,
+                    status: isErr ? 'error' : 'success',
+                    call_id: toolCall.id
+                });
+            } catch {}
+
+            // 控制重复与错误的推送：若已出现成功，则跳过后续错误的卡片推送
+            const stopOnFirstSuccess = this.shouldStopOnFirstSuccess(messages);
+            (this as any)._mcpHasSuccess = (this as any)._mcpHasSuccess || false;
+            const hasSuccess = (this as any)._mcpHasSuccess as boolean;
+
+            // 向前端推送原始 MCP content 数组，避免错误 JSON.parse
+            if (!(hasSuccess && isErr)) {
+                const toolResultPush = this.createToolResultPush(serverName, toolName, toolArgs, toolResult.content);
+                this.pushMessage(toolResultPush);
+            }
+
             // 继续与工具结果的对话
             messages = this.updateMessages(messages, toolCall, toolsContent, toolResultContent);
+
+            // 桥接：若当前错误文本暗示“无法创建 docx/只能纯文本/请用 docx 技能”，尝试在已连接服务器中查找 docx/word 相关工具以自动完成创建与写入
+            // 注意：不要依赖上层作用域的 decisionCfg，这里显式获取一次，避免未定义错误
+            const decisionCfg = this.getToolDecisionConfig();
+            if (isErr && this.isDocxSkillHint(textForJudge) && decisionCfg && decisionCfg.docx && decisionCfg.docx.bridgeOnError) {
+                try {
+                    // 仅桥接一次，避免死循环
+                    (this as any)._docxBridgeDone = (this as any)._docxBridgeDone || false;
+                    if (!(this as any)._docxBridgeDone) {
+                        try { this.pushProgress('docx_bridge_started', { from_server: serverName, from_tool: toolName }); } catch {}
+                        const docxTargets = await this.findDocxToolsAcrossSessions();
+                        if (docxTargets && (docxTargets.readToolName || docxTargets.writeToolName || docxTargets.createToolName)) {
+                            const docxSession = this.sessions.get(docxTargets.serverName);
+                            if (docxSession) {
+                                const { path: docxPath, content: docxText } = this.extractDocxPathAndContent(toolArgs, toolsContent, messages);
+                                if (docxPath) {
+                                    let bridgeSucceeded = false;
+                                    const timeId = `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+                                    // 先尝试读取（若存在 read 工具，且当前为读取场景或无内容）
+                                    if (docxTargets.readToolName && (!docxText || MCPCompat.isReadLikeTool(toolName))) {
+                                        try {
+                                            try { this.pushProgress('docx_bridge_step_started', { step: 'read', server: docxTargets.serverName, tool: docxTargets.readToolName }); } catch {}
+                                            let readArgs: any = { file_path: docxPath };
+                                            const fullReadName = `${this.enPunycode(docxTargets.serverName)}__${docxTargets.readToolName}`;
+                                            readArgs = this.ensureGenericPathArg(fullReadName, docxTargets.readToolName!, readArgs, toolsContent, messages);
+                                            readArgs = this.ensureArgsBySchema(fullReadName, readArgs, /*wantWrite*/ false);
+                                            const readResult = await this.executeToolCall(docxSession, docxTargets.readToolName!, readArgs);
+                                            const readPush = this.createToolResultPush(docxTargets.serverName, docxTargets.readToolName!, readArgs, readResult.content);
+                                            this.pushMessage(readPush);
+                                            try { this.pushProgress('docx_bridge_step_finished', { step: 'read', server: docxTargets.serverName, tool: docxTargets.readToolName, status: 'success' }); } catch {}
+                                            const fakeCallRead: OpenAI.Chat.Completions.ChatCompletionMessageToolCall = {
+                                                id: `docx-bridge-read-${timeId}`,
+                                                type: 'function',
+                                                function: { name: `${this.enPunycode(docxTargets.serverName)}__${docxTargets.readToolName!}`, arguments: JSON.stringify(readArgs) }
+                                            } as any;
+                                            const readContent = this.processToolResult(readResult);
+                                            messages = this.updateMessages(messages, fakeCallRead, `自动桥接：使用 ${docxTargets.serverName} 的 ${docxTargets.readToolName} 读取 docx 内容`, readContent);
+                                            const rTxt = this.extractTextFromContentJson(readContent);
+                                            if (rTxt && !this.isErrorText(rTxt)) bridgeSucceeded = true;
+                                        } catch (e) {
+                                            try { logger.warn('[MCP Docx] read bridge failed:', e as any); } catch {}
+                                            try { this.pushProgress('docx_bridge_step_finished', { step: 'read', server: docxTargets.serverName, tool: docxTargets.readToolName, status: 'error', message: (e && (e as any).message) || 'failed' }); } catch {}
+                                        }
+                                    }
+                                    // 可选：先创建
+                                    if (docxTargets.createToolName) {
+                                        try {
+                                            try { this.pushProgress('docx_bridge_step_started', { step: 'create', server: docxTargets.serverName, tool: docxTargets.createToolName }); } catch {}
+                                            let createArgs: any = { file_path: docxPath };
+                                            const fullCreateName = `${this.enPunycode(docxTargets.serverName)}__${docxTargets.createToolName}`;
+                                            createArgs = this.ensureGenericPathArg(fullCreateName, docxTargets.createToolName!, createArgs, toolsContent, messages);
+                                            createArgs = this.ensureArgsBySchema(fullCreateName, createArgs, /*wantWrite*/ true);
+                                            MCPCompat.fsEnsureParentDir(createArgs.file_path || createArgs.path);
+                                            const createResult = await this.executeToolCall(docxSession, docxTargets.createToolName!, createArgs);
+                                            const createPush = this.createToolResultPush(docxTargets.serverName, docxTargets.createToolName!, createArgs, createResult.content);
+                                            this.pushMessage(createPush);
+                                            try { this.pushProgress('docx_bridge_step_finished', { step: 'create', server: docxTargets.serverName, tool: docxTargets.createToolName, status: 'success' }); } catch {}
+                                            const fakeCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall = {
+                                                id: `docx-bridge-create-${timeId}`,
+                                                type: 'function',
+                                                function: { name: `${this.enPunycode(docxTargets.serverName)}__${docxTargets.createToolName!}`, arguments: JSON.stringify(createArgs) }
+                                            } as any;
+                                            const createContent = this.processToolResult(createResult);
+                                            messages = this.updateMessages(messages, fakeCall, `自动桥接：使用 ${docxTargets.serverName} 的 ${docxTargets.createToolName} 创建 docx`, createContent);
+                                            const cTxt = this.extractTextFromContentJson(createContent);
+                                            if (cTxt && !this.isErrorText(cTxt)) bridgeSucceeded = true;
+                                        } catch (e) {
+                                            try { logger.warn('[MCP Docx] create bridge failed:', e as any); } catch {}
+                                            try { this.pushProgress('docx_bridge_step_finished', { step: 'create', server: docxTargets.serverName, tool: docxTargets.createToolName, status: 'error', message: (e && (e as any).message) || 'failed' }); } catch {}
+                                        }
+                                    }
+                                    // 再写入内容（若存在写入工具）
+                                    if (docxTargets.writeToolName && docxText) {
+                                        try {
+                                            try { this.pushProgress('docx_bridge_step_started', { step: 'write', server: docxTargets.serverName, tool: docxTargets.writeToolName }); } catch {}
+                                            let writeArgs: any = { file_path: docxPath, content: docxText };
+                                            const fullWriteName = `${this.enPunycode(docxTargets.serverName)}__${docxTargets.writeToolName}`;
+                                            writeArgs = this.ensureGenericPathArg(fullWriteName, docxTargets.writeToolName!, writeArgs, toolsContent, messages);
+                                            writeArgs = this.ensureArgsBySchema(fullWriteName, writeArgs, /*wantWrite*/ true);
+                                            MCPCompat.fsEnsureParentDir(writeArgs.file_path || writeArgs.path);
+                                            const writeResult = await this.executeToolCall(docxSession, docxTargets.writeToolName!, writeArgs);
+                                            const writePush = this.createToolResultPush(docxTargets.serverName, docxTargets.writeToolName!, writeArgs, writeResult.content);
+                                            this.pushMessage(writePush);
+                                            try { this.pushProgress('docx_bridge_step_finished', { step: 'write', server: docxTargets.serverName, tool: docxTargets.writeToolName, status: 'success' }); } catch {}
+                                            const fakeCall2: OpenAI.Chat.Completions.ChatCompletionMessageToolCall = {
+                                                id: `docx-bridge-write-${timeId}`,
+                                                type: 'function',
+                                                function: { name: `${this.enPunycode(docxTargets.serverName)}__${docxTargets.writeToolName!}`, arguments: JSON.stringify(writeArgs) }
+                                            } as any;
+                                            const writeContent = this.processToolResult(writeResult);
+                                            messages = this.updateMessages(messages, fakeCall2, `自动桥接：使用 ${docxTargets.serverName} 的 ${docxTargets.writeToolName} 写入 docx 内容`, writeContent);
+                                            const wTxt = this.extractTextFromContentJson(writeContent);
+                                            if (wTxt && !this.isErrorText(wTxt)) bridgeSucceeded = true;
+                                        } catch (e) {
+                                            try { logger.warn('[MCP Docx] write bridge failed:', e as any); } catch {}
+                                            try { this.pushProgress('docx_bridge_step_finished', { step: 'write', server: docxTargets.serverName, tool: docxTargets.writeToolName, status: 'error', message: (e && (e as any).message) || 'failed' }); } catch {}
+                                        }
+                                    }
+
+
+                                    if (bridgeSucceeded) {
+                                        (this as any)._mcpHasSuccess = true;
+                                        (this as any)._docxBridgeDone = true;
+                                        try { this.pushProgress('docx_bridge_finished', { status: 'success' }); } catch {}
+                                        if (stopOnFirstSuccess) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    try { logger.warn('[MCP Docx] bridge flow error:', e as any); } catch {}
+                    try { this.pushProgress('docx_bridge_finished', { status: 'error', message: (e && (e as any).message) || 'failed' }); } catch {}
+                }
+            }
+
+            // 首次成功后标记，并在“只返回内容”指令下直接退出循环
+            if (!isErr) {
+                (this as any)._mcpHasSuccess = true;
+                if (stopOnFirstSuccess) {
+                    break;
+                }
+            }
         }
 
         return messages;
@@ -1369,7 +2279,7 @@ export class MCPClient {
         const wantWrite = explicitlyAskMCP || hasWindowsPath ? (text.includes("写入") || text.includes("追加") || text.includes("覆盖")) : false;
         const wantJson = /json/.test(text);
 
-        // 整理可用工具列表
+        // 整理可用工具列表（按当前 MCP 列表动态生成，不做硬编码服务器名）
         const entries: { server: string, tool: string, full: string }[] = [];
         for (const t of (availableTools || [])) {
             const n = t && t.function && typeof t.function.name === 'string' ? t.function.name : '';
@@ -1379,51 +2289,101 @@ export class MCPClient {
             const tool = parts.slice(1).join('__');
             entries.push({ server, tool, full: n });
         }
+        const normalizeKey = (s: string) => this.dePunycode(s).toLowerCase().replace(/[-_\s]+/g, '');
 
-        // 优先在指定服务器（excel）中选择
+        // 基于消息内容的“动态服务器提及/排除”，不硬编码具体名称
         let pool = entries;
-        if (hintExcel) {
-            const excelPool = entries.filter(e => /excel/i.test(e.server) || /excel|sheet|workbook/i.test(e.tool));
-            if (excelPool.length > 0) pool = excelPool;
+        let strictPool = false;
+        const messageNorm = textRaw.toLowerCase();
+        const serversMentioned: string[] = [];
+        const serversOnlyUse: string[] = [];
+        const serversAvoid: string[] = [];
+
+        // 从 entries 中抽取现有服务器名，按消息包含进行匹配
+        const serverNames = Array.from(new Set(entries.map(e => this.dePunycode(e.server))));
+        for (const s of serverNames) {
+            const sNorm = s.toLowerCase();
+            const mentioned = messageNorm.includes(sNorm);
+            const onlyUse = mentioned && (/(只用|仅用|仅使用|只使用)/.test(messageNorm));
+            const avoid = mentioned && (/(不使用|不要使用|不要用|禁用)/.test(messageNorm));
+            if (mentioned) serversMentioned.push(s);
+            if (onlyUse) serversOnlyUse.push(s);
+            if (avoid) serversAvoid.push(s);
+        }
+
+        // 如果明确“只用”某个服务器，则仅保留该服务器的工具
+        if (serversOnlyUse.length > 0) {
+            const keys = serversOnlyUse.map(normalizeKey);
+            const filtered = entries.filter(e => keys.some(k => normalizeKey(e.server).includes(k)));
+            if (filtered.length > 0) {
+                pool = filtered;
+                strictPool = true;
+            }
+        } else if (serversMentioned.length > 0) {
+            // 若只是“提及”某些服务器，尽量从这些服务器中挑选（保留回退）
+            const keys = serversMentioned.map(normalizeKey);
+            const filtered = entries.filter(e => keys.some(k => normalizeKey(e.server).includes(k)));
+            if (filtered.length > 0) {
+                pool = filtered;
+            }
+        }
+
+        // 若明确“不要使用”某些服务器，则从池中排除，并开启严格池，避免回退
+        if (serversAvoid.length > 0) {
+            const keys = serversAvoid.map(normalizeKey);
+            const filtered = pool.filter(e => !keys.some(k => normalizeKey(e.server).includes(k)));
+            pool = filtered.length > 0 ? filtered : pool;
+            strictPool = true;
         }
 
         // 选择策略：按意图与扩展名偏好
         const pickBy = (predicate: (e: {server:string,tool:string,full:string}) => boolean): string | null => {
-            const found = pool.find(predicate) || entries.find(predicate);
+            const found = pool.find(predicate) || (!strictPool ? entries.find(predicate) : undefined);
             return found ? found.full : null;
         };
 
-        if (wantRead) {
-            // Excel 优先：read + (excel/sheet/workbook)
-            if (hintExcel) {
-                const excelRead = pickBy(e => /read/i.test(e.tool) && /excel|sheet|workbook/i.test(e.tool));
-                if (excelRead) return excelRead;
-            }
-            // JSON 优先
-            if (wantJson) {
-                const jsonRead = pickBy(e => /read_?json_?file$/i.test(e.tool) || (/read/i.test(e.tool) && /json/i.test(e.tool)));
-                if (jsonRead) return jsonRead;
-            }
-            // 文本文件读取
-            const textRead = pickBy(e => /read_?text_?file$/i.test(e.tool));
-            if (textRead) return textRead;
-            // 兜底：任意包含 read 且与 file 相关
-            const anyRead = pickBy(e => /read/i.test(e.tool) && /file|text|content/i.test(e.tool));
-            if (anyRead) return anyRead;
-        } else if (wantWrite) {
-            if (hintExcel) {
-                const excelWrite = pickBy(e => /write|append/i.test(e.tool) && /excel|sheet|workbook/i.test(e.tool));
-                if (excelWrite) return excelWrite;
-            }
-            const writeFile = pickBy(e => /write_?file$/i.test(e.tool));
-            if (writeFile) return writeFile;
-            const appendFile = pickBy(e => /append_?text_?file$/i.test(e.tool) || /append_?file$/i.test(e.tool));
-            if (appendFile) return appendFile;
-            const anyWrite = pickBy(e => /write|append/i.test(e.tool) && /file|text|content/i.test(e.tool));
-            if (anyWrite) return anyWrite;
+        // 尽量不做硬编码：仅在用户明确点名“工具名”时强制选择
+        const toolNames = Array.from(new Set(entries.map(e => e.tool))).sort((a, b) => b.length - a.length);
+        const toolsMentioned: string[] = [];
+        for (const tName of toolNames) {
+            const tNorm = tName.toLowerCase();
+            if (messageNorm.includes(tNorm)) toolsMentioned.push(tName);
+        }
+        if (toolsMentioned.length > 0) {
+            // 优先从当前池选择被点名的工具
+            const tKey = toolsMentioned[0];
+            const chosen = pool.find(e => e.tool.toLowerCase() === tKey.toLowerCase()) || (!strictPool ? entries.find(e => e.tool.toLowerCase() === tKey.toLowerCase()) : undefined);
+            if (chosen) return chosen.full;
         }
 
+        // 不强制选择具体工具：若未明确点名工具名，则返回 null，让模型自动选择
+
         return null;
+    }
+
+    /**
+     * 判断是否应当为当前消息禁用工具（tool_choice = "none"），以保障普通对话质量。
+     * 规则：若不存在明显的工具使用意图（文件/路径/HTTP/Excel/显式“使用工具”等），则禁用工具。
+     */
+    private shouldDisableToolsForMessage(messages: ChatCompletionMessageParam[]): boolean {
+        const lastUser = this.getLastUserText(messages) || "";
+        const text = lastUser.toLowerCase();
+
+        // 明显的“要用工具”指示
+        const explicitToolHints = [
+            "使用mcp工具", "使用 mcp 工具", "mcp", "调用工具", "用工具",
+            "claude code", "claude-code", "excel-mcp-server", "excel mcp server",
+        ];
+        if (explicitToolHints.some(k => text.includes(k))) return false;
+
+        // 具备路径/URL/文件等强烈工具使用信号
+        const hasWindowsPath = /[a-z]:\\\\/i.test(text) || /[a-z]:\//i.test(text) || /[a-z]:\\/i.test(text);
+        const hasUrl = /https?:\/\//i.test(text);
+        const hasFileKeywords = /(读取|读|写入|追加|覆盖|保存|打开|目录|路径|文件|excel|工作簿|工作表|sheet)/i.test(lastUser);
+        if (hasWindowsPath || hasUrl || hasFileKeywords) return false;
+
+        // 默认禁用工具，保证普通问答直出文本
+        return true;
     }
 
     /**
@@ -1433,16 +2393,94 @@ export class MCPClient {
      * @param {any} toolArgs - 工具参数
      * @returns {Promise<MCPToolResult>} - 工具调用结果的 Promise
      */
-    private async executeToolCall(session: Client, toolName: string, toolArgs: any): Promise<MCPToolResult> {
+    private async executeToolCall(session: Client, serverName: string, toolName: string, toolArgs: any, callId?: string): Promise<MCPToolResult> {
+        const ctrl = new AbortController();
+        if (callId) this.activeToolCalls.set(callId, ctrl);
+        const cfg = this.serverConfigs.get(serverName);
+        const timeoutMs = cfg && typeof (cfg as any).timeout === 'number' ? Number((cfg as any).timeout) * 1000 : 60000;
+        const longRunning = !!(cfg && (cfg as any).longRunning);
+        const maxTotalTimeout = longRunning ? 10 * 60 * 1000 : undefined;
         try {
-            const result = await session.callTool({
+            const result = await (session as any).callTool({
                 name: toolName,
                 arguments: toolArgs
+            }, undefined, {
+                onprogress: (process: any) => {
+                    try {
+                        const total = Number(process?.total || 1);
+                        const progressVal = Number(process?.progress || 0);
+                        const ratio = total ? (progressVal / total) : 0;
+                        this.pushProgress('tool_call_progress', { server: serverName, tool: toolName, call_id: callId, progress: ratio, progress_value: progressVal, total: total });
+                    } catch {}
+                },
+                timeout: timeoutMs,
+                resetTimeoutOnProgress: longRunning,
+                maxTotalTimeout,
+                signal: ctrl.signal
             });
             return result as unknown as MCPToolResult;
         } catch (error) {
+            if (callId) this.activeToolCalls.delete(callId);
             logger.error(`Failed to execute tool call for ${toolName}:`, error);
             throw error;
+        } finally {
+            if (callId) this.activeToolCalls.delete(callId);
+        }
+    }
+
+    /**
+     * 在所有已连接的服务器中查找可用于“docx/Word 创建或写入”的工具
+     * 返回优先的写入型工具与可选的创建型工具。
+     */
+    private async findDocxToolsAcrossSessions(): Promise<{ serverName: string, readToolName?: string, writeToolName?: string, createToolName?: string } | null> {
+        try {
+            // 若此前已缓存工具 schema，尽量复用；否则动态拉取
+            const candidates: { serverName: string, toolName: string, desc: string }[] = [];
+            for (const [serverName, session] of this.sessions) {
+                let tools: Tool[] = [];
+                try {
+                    const resp = await session.listTools();
+                    tools = resp.tools || [];
+                } catch {}
+                for (const t of tools) {
+                    const name = (t?.name || '').toString();
+                    const desc = (t?.description || '').toString();
+                    const s = `${name} ${desc}`.toLowerCase();
+                    if (/docx|word/.test(s)) {
+                        candidates.push({ serverName, toolName: name, desc });
+                    }
+                }
+            }
+            if (candidates.length === 0) return null;
+            const rank = (toolName: string, desc: string): ('read'|'write'|'create'|'unknown') => {
+                const s = `${toolName} ${desc}`.toLowerCase();
+                if (/(read|open|extract|parse|text)/.test(s)) return 'read';
+                if (/(write|append|insert|add|update|replace)/.test(s)) return 'write';
+                if (/(create|new|generate|make|build)/.test(s)) return 'create';
+                return 'unknown';
+            };
+            let readTool: { serverName: string, toolName: string } | null = null;
+            let writeTool: { serverName: string, toolName: string } | null = null;
+            let createTool: { serverName: string, toolName: string } | null = null;
+            for (const c of candidates) {
+                const kind = rank(c.toolName, c.desc);
+                if (kind === 'read' && !readTool) readTool = { serverName: c.serverName, toolName: c.toolName };
+                if (kind === 'write' && !writeTool) writeTool = { serverName: c.serverName, toolName: c.toolName };
+                if (kind === 'create' && !createTool) createTool = { serverName: c.serverName, toolName: c.toolName };
+                if (readTool && writeTool && createTool) break;
+            }
+            if (readTool || writeTool || createTool) {
+                return {
+                    serverName: (readTool?.serverName || writeTool?.serverName || createTool!.serverName),
+                    readToolName: readTool?.toolName,
+                    writeToolName: writeTool?.toolName,
+                    createToolName: createTool?.toolName
+                };
+            }
+            return null;
+        } catch (e) {
+            try { logger.warn('[MCP Docx] find tools failed:', e as any); } catch {}
+            return null;
         }
     }
 
@@ -1451,16 +2489,46 @@ export class MCPClient {
      * @param {string} serverName - 服务器名称
      * @param {string} toolName - 工具名称
      * @param {any} toolArgs - 工具参数
-     * @param {string} toolResultContent - 工具调用结果内容
+     * @param {any} toolResultRaw - 工具调用结果原始内容（通常为 MCP content 数组）
      * @returns {any} - 工具调用结果推送对象
      */
-    private createToolResultPush(serverName: string, toolName: string, toolArgs: any, toolResultContent: string): any {
+    private createToolResultPush(serverName: string, toolName: string, toolArgs: any, toolResultRaw: any): any {
+        // 统一为前端期望的 content 数组结构（兼容多服务端差异）
+        const toolResultArray = MCPCompat.normalizeContentArray(toolResultRaw);
         return {
             "tool_server": serverName,
             "tool_name": toolName,
             "tool_args": toolArgs,
-            "tool_result": JSON.parse(toolResultContent)
+            "tool_result": toolResultArray
         };
+    }
+
+    /**
+     * 创建进度事件推送对象（统一使用 <mcptool> 包裹，前端通过 type:'progress' 区分）
+     * @param {string} event - 事件名称
+     * @param {any} payload - 事件负载（通用结构，避免硬编码）
+     * @returns {any} - 进度事件对象
+     */
+    private createProgressPush(event: string, payload: any): any {
+        const base: any = { type: 'progress', event, ts: Date.now() };
+        try {
+            if (payload && typeof payload === 'object') {
+                Object.assign(base, payload);
+            } else if (payload !== undefined) {
+                base.payload = payload;
+            }
+        } catch {}
+        return base;
+    }
+
+    /**
+     * 推送进度事件
+     * @param {string} event - 事件名称
+     * @param {any} payload - 事件负载
+     */
+    private pushProgress(event: string, payload: any): void {
+        const obj = this.createProgressPush(event, payload);
+        this.pushMessage(obj);
     }
 
     /**
@@ -1544,8 +2612,30 @@ export class MCPClient {
 
         // 处理工具调用
         if (Object.keys(toolCallMap).length > 0) {
+            // 工具调用准备完成，推送一次进度事件（不包含敏感信息）
+            try {
+                const readyList = Object.values(toolCallMap).map(tc => ({
+                    id: tc.id,
+                    name: (tc.function && tc.function.name) || ''
+                }));
+                this.pushProgress('tool_calls_ready', { list: readyList });
+            } catch {}
+
             messages = await this.callTools(toolCallMap, messages, toolsContent);
-            let last_message = messages[messages.length - 1];
+
+            // 优先选择最后一个“非错误”的工具文本消息，避免末尾错误覆盖前面成功
+            const pickLastNonErrorToolTextMessage = (msgs: ChatCompletionMessageParam[]): ChatCompletionMessageParam | null => {
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                    const m = msgs[i];
+                    if (m && m.role === 'tool' && typeof m.content === 'string') {
+                        const txt = this.extractTextFromContentJson(m.content as string);
+                        if (txt && !this.isErrorText(txt)) return m;
+                    }
+                }
+                return null;
+            };
+
+            let last_message = pickLastNonErrorToolTextMessage(messages) || messages[messages.length - 1];
 
             // 尝试解析工具返回的文本，并在满足条件时直接结束流
             if (last_message.content) {
@@ -1617,6 +2707,156 @@ export class MCPClient {
     }
 
     /**
+     * 尝试修复模型生成的工具参数 JSON 字符串中的常见问题，返回修复后的字符串。
+     * 仅进行“安全修复”：
+     * - 对被双引号括起来的 Windows 路径值（形如 "C:\\..." 或 "D:\\..."），将其中的单个反斜杠替换为双反斜杠
+     * - 去除路径值末尾混入的中文说明或标点（在首个合法扩展名之后裁切）
+     */
+    private repairJsonArguments(raw: string): string {
+        if (!raw || typeof raw !== 'string') return raw;
+
+        let s = raw;
+
+        // 修复：双引号包裹的 Windows 路径值内，反斜杠未转义
+        // 仅在值看起来是驱动器开头的路径时进行替换，避免误伤其它 JSON 转义序列
+        // 示例匹配："D:\work\ad-test.txt"
+        const pathValueRegex = /(:\s*")([A-Za-z]:\\[^"\n\r]*?)(")/g;
+        s = s.replace(pathValueRegex, (m, p1, p2, p3) => {
+            // 将路径中的单反斜杠替换为双反斜杠
+            const escapedPath = p2.replace(/\\/g, "\\\\");
+            return p1 + escapedPath + p3;
+        });
+
+        // 额外修复：若路径末尾在合法扩展名之后混入中文说明或标点，则先裁切
+        // 为避免复杂的 JSON 解析，这里仍在字符串层做有限处理
+        // 合法扩展名列表（与 ensureGenericPathArg/ensureFilePathArg 保持一致的大众类型）
+        const exts = [
+            'txt','md','json','csv','log','ini','conf','xml','yml','yaml','html','htm','js','ts','tsx','jsx','java','py','go','rb','php','c','cpp','h','hpp','css'
+        ];
+        const chineseTail = /([\u4e00-\u9fa5，。？！；：：、…【】《》“”‘’\(\)（）\s].*)$/;
+
+        s = s.replace(/(:\s*")([A-Za-z]:\\[^"\n\r]*?)(")/g, (m, p1, p2, p3) => {
+            let pathStr = p2;
+            // 查找首个合法扩展名位置
+            const dotIdx = pathStr.lastIndexOf('.');
+            if (dotIdx > 0) {
+                const ext = pathStr.slice(dotIdx + 1).toLowerCase();
+                // 若扩展名后还有中文说明或标点，尝试裁切至扩展名末尾
+                if (exts.includes(ext)) {
+                    const afterExt = pathStr.slice(dotIdx + 1);
+                    if (chineseTail.test(afterExt)) {
+                        pathStr = pathStr.slice(0, dotIdx + 1 + ext.length);
+                    }
+                }
+            }
+            const escapedPath = pathStr.replace(/\\/g, "\\\\");
+            return p1 + escapedPath + p3;
+        });
+
+        return s;
+    }
+
+    /**
+     * 获取工具决策配置（从用户数据目录 config.json 中读取），并提供默认值
+     */
+    private getToolDecisionConfig(): any {
+        try {
+            const cfg = pub.C('toolDecision');
+            const def = {
+                mode: 'injection', // injection|gate|auto
+                confirmationHint: true, // 是否在工具调用前要求模型先提示一句（启用“先自查、后调用”）
+                keywords: {
+                    explicitToolHints: [
+                        '使用mcp工具', '使用 mcp 工具', 'mcp', '调用工具', '用工具',
+                        'claude code', 'claude-code', 'excel-mcp-server', 'excel mcp server'
+                    ],
+                    fileKeywords: [
+                        '读取','读','写入','追加','覆盖','保存','打开','目录','路径','文件','excel','工作簿','工作表','sheet'
+                    ]
+                },
+                docx: {
+                    // 是否允许在“明确 docx 意图且已解析到路径与内容”时，跳过模型直接调用具备 docx 能力的工具（默认关闭）
+                    directFallback: false,
+                    // 是否在工具调用发生错误且错误文本暗示需要 docx/word 能力时，尝试自动桥接到具备 docx 能力的服务器（默认关闭）
+                    bridgeOnError: false,
+                    // 在识别到 .docx 路径的场景下，默认禁用通用 Read 工具，避免对二进制 .docx 的误读
+                    disableGenericReadForDocx: true
+                },
+                systemPromptTemplate: (
+                    '你需要在每次回复前判断用户意图：是纯对话，还是需要使用工具。' +
+                    '仅在明确存在工具意图（出现工具名称、路径/URL、或文件/表格操作类关键词）时才调用工具；否则直接用中文回答。' +
+                    '工具调用分两阶段：第一阶段先用中文输出“计划与参数确认”，包含：将要调用的工具名称、调用理由、参数草案及其合规性检查（路径/扩展名/表名/内容类型）；若关键参数不明确，请先向用户澄清，不要盲目调用。第二阶段在参数确认后再发起调用，并用中文解释返回结果与后续处理。' +
+                    '若决定调用工具，应先简要说明你将调用的工具及原因，再进行调用。' +
+                    '\n工具选择原则提示：Excel 工具仅适用于 .xlsx/.xls；Word（.docx）请使用具备 docx 能力的工具；不要使用 Excel 工具处理 .docx。' +
+                    '\nClaude Code 特殊说明：当调用 claude code__Skill 时，必须在参数中明确给出技能名称（优先使用 skill 或 skill_name；也可使用 command/cmd/action），并提供 args/arguments（JSON 结构）作为技能参数；若不清楚技能名，请先请求列出技能（例如使用 Skill 列表），再确认后调用。' +
+                    '\n不要仅凭最近用户消息中的某个词语（如“读取”、“写入”）武断选择工具；应先自查 MCP 工具的名称、描述与 schema，并在参数确认后再调用。'
+                )
+            };
+            const merged = Object.assign({}, def, cfg || {});
+            merged.keywords = Object.assign({}, def.keywords, (cfg && cfg.keywords) || {});
+            return merged;
+        } catch (e) {
+            return {
+                mode: 'injection',
+                confirmationHint: true,
+                keywords: {
+                    explicitToolHints: [
+                        '使用mcp工具', '使用 mcp 工具', 'mcp', '调用工具', '用工具',
+                        'claude code', 'claude-code', 'excel-mcp-server', 'excel mcp server'
+                    ],
+                    fileKeywords: [
+                        '读取','读','写入','追加','覆盖','保存','打开','目录','路径','文件','excel','工作簿','工作表','sheet'
+                    ]
+                },
+                docx: {
+                    directFallback: false,
+                    bridgeOnError: false,
+                    disableGenericReadForDocx: true
+                },
+                systemPromptTemplate: (
+                    '你需要在每次回复前判断用户意图：是纯对话，还是需要使用工具。' +
+                    '仅在明确存在工具意图（出现工具名称、路径/URL、或文件/表格操作类关键词）时才调用工具；否则直接用中文回答。' +
+                    '工具调用分两阶段：第一阶段先用中文输出“计划与参数确认”，包含：将要调用的工具名称、调用理由、参数草案及其合规性检查（路径/扩展名/表名/内容类型）；若关键参数不明确，请先向用户澄清，不要盲目调用。第二阶段在参数确认后再发起调用，并用中文解释返回结果与后续处理。' +
+                    '若决定调用工具，应先简要说明你将调用的工具及原因，再进行调用。' +
+                    '\n工具选择原则提示：Excel 工具仅适用于 .xlsx/.xls；Word（.docx）请使用具备 docx 能力的工具；不要使用 Excel 工具处理 .docx。' +
+                    '\nClaude Code 特殊说明：当调用 claude code__Skill 时，必须在参数中明确给出技能名称（优先使用 skill 或 skill_name；也可使用 command/cmd/action），并提供 args/arguments（JSON 结构）作为技能参数；若不清楚技能名，请先请求列出技能（例如使用 Skill 列表），再确认后调用。' +
+                    '\n不要仅凭最近用户消息中的某个词语（如“读取”、“写入”）武断选择工具；应先自查 MCP 工具的名称、描述与 schema，并在参数确认后再调用。'
+                )
+            };
+        }
+    }
+
+    /**
+     * 基于配置构建用于“工具决策”的系统提示消息
+     */
+    private buildDecisionSystemMessage(availableTools: any[], decisionCfg: any): ChatCompletionMessageParam | null {
+        if (!decisionCfg || decisionCfg.mode !== 'injection') return null;
+        try {
+            const toolNames = (availableTools || [])
+                .map((t: any) => {
+                    const server = t.server_name || t.server || '';
+                    const name = (t.tools && t.tools[0] && t.tools[0].function && t.tools[0].function.name) || t.name || '';
+                    return `${server ? server + '--' : ''}${name}`;
+                })
+                .filter((s: string) => !!s);
+
+            const hintConfirm = decisionCfg.confirmationHint ? '在决定调用工具前，请先简要说明将调用的工具及原因。' : '';
+            const sysContent = [
+                decisionCfg.systemPromptTemplate,
+                hintConfirm,
+                toolNames.length ? `可用工具列表（供参考）：${toolNames.join(', ')}` : ''
+            ].filter(Boolean).join('\n');
+
+            return {
+                role: 'system',
+                content: sysContent
+            } as ChatCompletionMessageParam;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
      * 处理工具调用
      * @param {any} availableTools - 可用的工具列表
      * @param {ChatCompletionMessageParam[]} messages - 消息列表
@@ -1626,17 +2866,52 @@ export class MCPClient {
     async handleToolCalls(availableTools: any, messages: ChatCompletionMessageParam[], isRecursive = false) {
         // 调用OpenAI API
         try {
+            const decisionCfg = this.getToolDecisionConfig();
+            // 进度：工具判定开始（列出可用工具简要信息）
+            try {
+                const toolNames = (Array.isArray(availableTools) ? availableTools : []).map((t: any) => {
+                    const server = t.server_name || t.server || '';
+                    const name = (t.tools && t.tools[0] && t.tools[0].function && t.tools[0].function.name) || t.name || '';
+                    return { server, name };
+                }).filter((e: any) => e.server || e.name);
+                this.pushProgress('tool_decision_started', { tools_count: toolNames.length, tools: toolNames.slice(0, 50) });
+            } catch {}
+            // 针对 .docx 场景的安全防误用：可选地在当前调用中移除通用 Read 工具，避免错误读取二进制文件
+            let toolsForUse: any[] = Array.isArray(availableTools) ? [...availableTools] : (availableTools || []);
+            try {
+                const lastUser = this.getLastUserText(messages) || '';
+                const hasDocxPath = /\.docx\b/i.test(lastUser);
+                if (hasDocxPath && decisionCfg?.docx?.disableGenericReadForDocx) {
+                    const hasDocxCap = toolsForUse.some(t => {
+                        const n = ((t && t.function && t.function.name) || '').toLowerCase();
+                        const d = ((t && t.function && t.function.description) || '').toLowerCase();
+                        return n.includes('docx') || n.includes('word') || d.includes('docx') || d.includes('word');
+                    });
+                    toolsForUse = toolsForUse.filter(t => {
+                        const n = ((t && t.function && t.function.name) || '').toLowerCase();
+                        const bare = n.split('__').pop() || '';
+                        return bare !== 'read';
+                    });
+                    // 若不存在具备 docx 能力的工具，则默认不强制选择工具，让模型先计划并给出安装建议
+                    // （避免错误地调用通用 Read）
+                }
+            } catch {}
             // 根据用户最新消息尝试强制选择工具，避免模型在重复请求中不再调用 MCP
             let toolChoice: any = "auto";
-            const preferredToolName = this.extractPreferredToolName(messages, availableTools);
+            const preferredToolName = this.extractPreferredToolName(messages, toolsForUse);
             if (preferredToolName) {
                 toolChoice = { type: "function", function: { name: preferredToolName } };
+            } else if (decisionCfg && decisionCfg.mode === 'gate') {
+                // gate 模式：根据自定义关键词与信号禁用工具（可配置）
+                if (this.shouldDisableToolsForMessageWithCfg(messages, decisionCfg)) {
+                    toolChoice = "none";
+                }
             }
 
             const completion = await this.openai.chat.completions.create({
                 model: this.model,
                 messages,
-                tools: availableTools,
+                tools: toolsForUse,
                 tool_choice: toolChoice,
                 stream: true
             });
@@ -1645,6 +2920,9 @@ export class MCPClient {
             await this.handleOpenAIToolCalls(completion, messages, availableTools);
         } catch (error) {
             logger.error("Failed to call OpenAI API:", error);
+            try {
+                this.pushProgress('tool_decision_failed', { message: (error && (error.message || error.toString())) || 'unknown error' });
+            } catch {}
             throw error;
         }
     }
@@ -1672,6 +2950,136 @@ export class MCPClient {
             this.push = push;
             this.callback = callback;
 
+            // 注入“工具决策”系统提示（配置驱动），让模型自己判断对话/工具
+            const decisionCfg = this.getToolDecisionConfig();
+            const sysMsg = this.buildDecisionSystemMessage(availableTools, decisionCfg);
+            if (sysMsg) {
+                messages = [sysMsg, ...messages];
+            }
+
+            // 可选的“无模型回退”：受配置控制，避免硬编码流程
+            if (decisionCfg?.docx?.directFallback) {
+            // 若用户消息显式包含 docx/Word 创建意图且可解析到 .docx 路径与内容，
+            // 则直接调用 “claude code” 的 Write 工具尝试创建/写入（让其内部技能接管），无需等待模型生成 tool_calls。
+            try {
+                const lastUser = this.getLastUserText(messages) || "";
+                const userHasDocxIntent = /\bdocx\b|\bword\b|\.docx\b/i.test(lastUser);
+                const { path: docxPath, content: docxText } = this.extractDocxPathAndContent({}, "", messages);
+                const shouldCallDirect = !!docxPath && !!docxText && userHasDocxIntent;
+                // 严格判断：工具未被 gate 模式禁用，且当前会话存在“claude code”服务器
+                const toolsDisabled = (decisionCfg && decisionCfg.mode === 'gate') ? this.shouldDisableToolsForMessageWithCfg(messages, decisionCfg) : false;
+                const claudeSession = this.sessions.get(this.enPunycode('claude code')) || this.sessions.get('claude code');
+
+                if (shouldCallDirect && !toolsDisabled && claudeSession) {
+                    // 构造 Write 调用参数，让 Claude Code 的技能根据扩展名接管
+                    let writeArgs: any = { file_path: docxPath, content: docxText };
+                    const fullWriteFuncName = `${this.enPunycode('claude code')}__Write`;
+                    writeArgs = this.ensureGenericPathArg(fullWriteFuncName, 'Write', writeArgs, "", messages);
+                    writeArgs = this.ensureArgsBySchema(fullWriteFuncName, writeArgs, /*wantWrite*/ true);
+                    MCPCompat.fsEnsureParentDir(writeArgs.file_path || writeArgs.path);
+
+                    try { this.pushProgress('direct_docx_write_started', { server: 'claude code', tool: 'Write', args: writeArgs }); } catch {}
+                    // 执行工具调用
+                    const result = await this.executeToolCall(claudeSession, 'Write', writeArgs);
+                    const pushObj = this.createToolResultPush('claude code', 'Write', writeArgs, result.content);
+                    this.pushMessage(pushObj);
+
+                    // 更新消息（模拟一次工具调用）
+                    const fakeToolCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall = {
+                        id: `direct-docx-write-${Date.now()}`,
+                        type: 'function',
+                        function: { name: fullWriteFuncName, arguments: JSON.stringify(writeArgs) }
+                    } as any;
+                    const toolResultContent = this.processToolResult(result);
+                    messages = this.updateMessages(messages, fakeToolCall, '直接调用：使用 claude code 的 Write 工具写入 docx（无模型回退）', toolResultContent);
+
+                    // 若检测到成功文本，则标记并跳过后续模型调用，直接结束
+                    const wTxt = this.extractTextFromContentJson(toolResultContent);
+                    if (wTxt && !this.isErrorText(wTxt)) {
+                        (this as any)._mcpHasSuccess = true;
+                        const chunk = {
+                            created_at: Date.now(),
+                            index: 0,
+                            choices: [ { finish_reason: 'stop', delta: { content: wTxt } } ]
+                        };
+                        this.callback(chunk);
+                        try { this.pushProgress('direct_docx_write_finished', { server: 'claude code', tool: 'Write', status: 'success' }); } catch {}
+                        return '';
+                    }
+                    // 若失败但错误文本提示“请用 docx 技能/只能纯文本”等，则进入桥接流程（复用 callTools 中已有逻辑）：
+                    const errTxt = wTxt || '';
+                    if (errTxt && this.isDocxSkillHint(errTxt)) {
+                        try {
+                            try { this.pushProgress('docx_bridge_started', { from_server: 'claude code', from_tool: 'Write' }); } catch {}
+                            const docxTargets = await this.findDocxToolsAcrossSessions();
+                            if (docxTargets) {
+                                const docxSession = this.sessions.get(docxTargets.serverName);
+                                if (docxSession) {
+                                    // 可选先创建
+                                    if (docxTargets.createToolName) {
+                                        let createArgs: any = { file_path: docxPath };
+                                        const fullCreateName = `${this.enPunycode(docxTargets.serverName)}__${docxTargets.createToolName}`;
+                                        createArgs = this.ensureGenericPathArg(fullCreateName, docxTargets.createToolName!, createArgs, "", messages);
+                                        createArgs = this.ensureArgsBySchema(fullCreateName, createArgs, true);
+                                        MCPCompat.fsEnsureParentDir(createArgs.file_path || createArgs.path);
+                                        try { this.pushProgress('docx_bridge_step_started', { step: 'create', server: docxTargets.serverName, tool: docxTargets.createToolName }); } catch {}
+                                        const createRes = await this.executeToolCall(docxSession, docxTargets.createToolName!, createArgs);
+                                        const createPush = this.createToolResultPush(docxTargets.serverName, docxTargets.createToolName!, createArgs, createRes.content);
+                                        this.pushMessage(createPush);
+                                        try { this.pushProgress('docx_bridge_step_finished', { step: 'create', server: docxTargets.serverName, tool: docxTargets.createToolName, status: 'success' }); } catch {}
+                                        const fakeCreateCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall = {
+                                            id: `direct-docx-create-${Date.now()}`,
+                                            type: 'function',
+                                            function: { name: fullCreateName, arguments: JSON.stringify(createArgs) }
+                                        } as any;
+                                        const createContent = this.processToolResult(createRes);
+                                        messages = this.updateMessages(messages, fakeCreateCall, `自动桥接：使用 ${docxTargets.serverName} 的 ${docxTargets.createToolName} 创建 docx`, createContent);
+                                    }
+                                    // 再写入
+                                    if (docxTargets.writeToolName) {
+                                        let wArgs: any = { file_path: docxPath, content: docxText };
+                                        const fullName = `${this.enPunycode(docxTargets.serverName)}__${docxTargets.writeToolName}`;
+                                        wArgs = this.ensureGenericPathArg(fullName, docxTargets.writeToolName!, wArgs, "", messages);
+                                        wArgs = this.ensureArgsBySchema(fullName, wArgs, true);
+                                        MCPCompat.fsEnsureParentDir(wArgs.file_path || wArgs.path);
+                                        try { this.pushProgress('docx_bridge_step_started', { step: 'write', server: docxTargets.serverName, tool: docxTargets.writeToolName }); } catch {}
+                                        const wRes = await this.executeToolCall(docxSession, docxTargets.writeToolName!, wArgs);
+                                        const wPush = this.createToolResultPush(docxTargets.serverName, docxTargets.writeToolName!, wArgs, wRes.content);
+                                        this.pushMessage(wPush);
+                                        try { this.pushProgress('docx_bridge_step_finished', { step: 'write', server: docxTargets.serverName, tool: docxTargets.writeToolName, status: 'success' }); } catch {}
+                                        const fakeCall2: OpenAI.Chat.Completions.ChatCompletionMessageToolCall = {
+                                            id: `direct-docx-bridge-write-${Date.now()}`,
+                                            type: 'function',
+                                            function: { name: fullName, arguments: JSON.stringify(wArgs) }
+                                        } as any;
+                                        const wContent = this.processToolResult(wRes);
+                                        messages = this.updateMessages(messages, fakeCall2, `自动桥接：使用 ${docxTargets.serverName} 的 ${docxTargets.writeToolName} 写入 docx 内容`, wContent);
+
+                                        const wTxt2 = this.extractTextFromContentJson(wContent);
+                                        if (wTxt2 && !this.isErrorText(wTxt2)) {
+                                            (this as any)._mcpHasSuccess = true;
+                                            const chunk = {
+                                                created_at: Date.now(),
+                                                index: 0,
+                                                choices: [ { finish_reason: 'stop', delta: { content: wTxt2 } } ]
+                                            };
+                                            this.callback(chunk);
+                                            return '';
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            try { logger.warn('[MCP Docx] direct bridge flow failed:', e as any); } catch {}
+                        }
+                    }
+                }
+            } catch (e) {
+                try { logger.warn('[MCP Docx] direct docx write fallback error:', e as any); } catch {}
+                // 不中断主流程
+            }
+            }
+
             // 处理工具调用
             await this.handleToolCalls(availableTools, messages);
         } catch (error) {
@@ -1698,6 +3106,33 @@ export class MCPClient {
         }
         // 此处可根据实际需求返回处理结果
         return '';
+    }
+
+    /**
+     * 带配置的“是否禁用工具”判断（关键词可由用户配置）
+     */
+    private shouldDisableToolsForMessageWithCfg(messages: ChatCompletionMessageParam[], decisionCfg: any): boolean {
+        const lastUser = this.getLastUserText(messages) || "";
+        const text = lastUser.toLowerCase();
+
+        const explicitToolHints = (decisionCfg && decisionCfg.keywords && Array.isArray(decisionCfg.keywords.explicitToolHints))
+            ? decisionCfg.keywords.explicitToolHints
+            : [
+                "使用mcp工具", "使用 mcp 工具", "mcp", "调用工具", "用工具",
+                "claude code", "claude-code", "excel-mcp-server", "excel mcp server",
+            ];
+        if (explicitToolHints.some((k: string) => text.includes(k))) return false;
+
+        const hasWindowsPath = /[a-z]:\\/i.test(text) || /[a-z]:\//i.test(text) || /[a-z]:\\/i.test(text);
+        const hasUrl = /https?:\/\//i.test(text);
+        const fileKeywordsList = (decisionCfg && decisionCfg.keywords && Array.isArray(decisionCfg.keywords.fileKeywords))
+            ? decisionCfg.keywords.fileKeywords
+            : ["读取","读","写入","追加","覆盖","保存","打开","目录","路径","文件","excel","工作簿","工作表","sheet"];
+        const fileKeywordsRegex = new RegExp(fileKeywordsList.map((k: string) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'i');
+        const hasFileKeywords = fileKeywordsRegex.test(lastUser);
+        if (hasWindowsPath || hasUrl || hasFileKeywords) return false;
+
+        return true;
     }
 
     /**

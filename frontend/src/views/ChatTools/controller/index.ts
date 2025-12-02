@@ -12,7 +12,7 @@ import { getSiderStoreData } from "@/views/Sider/store"
 import { getChatContentStoreData } from "@/views/ChatContent/store"
 import { getKnowledgeStoreData } from "@/views/KnowleadgeStore/store"
 import { getAgentStoreData } from "@/views/Agent/store"
-import { getChatToolsStoreData } from "../store"
+import { getChatToolsStoreData, useChatToolsStore } from "../store"
 import { getHeaderStoreData } from "@/views/Header/store"
 import { getSoftSettingsStoreData } from "@/views/SoftSettings/store"
 import { getThirdPartyApiStoreData } from "@/views/ThirdPartyApi/store"
@@ -36,9 +36,10 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
     const { targetNet, } = getSoftSettingsStoreData()
     const { currentTalkingChatId, isInChat, chatHistory, } = getChatContentStoreData()
     const { activeKnowledgeForChat, } = getKnowledgeStoreData()
-    const { netActive, temp_chat, mcpListChoosed } = getChatToolsStoreData()
+    const { netActive, temp_chat, mcpListChoosed, mcpStreamOffsets } = getChatToolsStoreData()
     const { currentSupplierName } = getThirdPartyApiStoreData()
     const { compare_id } = getChatToolsStoreData()
+    const chatToolsStore = useChatToolsStore()
     const chatAxiosArr = []
 
     /********** 单模型及多模型下的ollama处理 ***********/
@@ -68,6 +69,8 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
             await create_chat()
         }
         currentTalkingChatId.value = currentContextId.value
+        // 重置当前对话的 MCP 进度（避免上一次残留）
+        chatToolsStore.resetMcpProgress(currentContextId.value)
         // 找到当前对话的记录
         let currentChat: null | MultipeQuestionDto = null;
         for (let [key] of chatHistory.value) {
@@ -78,7 +81,7 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
 
         if (!multiModelList) {
             // 单模型下发送对话
-            await axios.post("http://127.0.0.1:7071/chat/chat", {
+            await axios.post("http://192.168.0.254:8081/chat/chat", {
                 model,
                 parameters,
                 supplierName: currentSupplierName.value,
@@ -93,6 +96,30 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
                 onDownloadProgress: (progressEvent: any) => {
                     // 获取当前接收到的部分响应数据
                     const currentResponse = progressEvent.event.currentTarget.responseText;
+                    // 增量解析 <mcptool>，派发 MCP 进度事件
+                    try {
+                        const key = `${currentContextId.value}:single`
+                        const prevOffset = mcpStreamOffsets.value.get(key) || 0
+                        const chunk = currentResponse.slice(prevOffset)
+                        mcpStreamOffsets.value.set(key, currentResponse.length)
+                        const reg = /<mcptool>([\s\S]*?)<\/mcptool>/g
+                        let match: RegExpExecArray | null
+                        while ((match = reg.exec(chunk)) !== null) {
+                            const jsonStr = match[1].trim()
+                            try {
+                                const obj = JSON.parse(jsonStr)
+                                if (obj && obj.type === 'progress') {
+                                    chatToolsStore.appendMcpProgress(currentContextId.value, {
+                                        ts: Date.now(),
+                                        event: obj.event || obj.step || 'progress',
+                                        payload: obj
+                                    })
+                                }
+                            } catch (_) {
+                                // 忽略解析失败，避免中断流式渲染
+                            }
+                        }
+                    } catch (_) {}
                     // 防止切换带来的错误
                     if (currentTalkingChatId.value == currentContextId.value) chatHistory.value.set(currentChat!, { content: currentResponse, stat: { model: currentModel.value }, id: "" })
                 }
@@ -100,7 +127,7 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
         } else {
             
             for (let i = 0; i < multiModelList!.length; i++) {
-                const chatAxios = axios.post("http://127.0.0.1:7071/chat/chat", {
+                const chatAxios = axios.post("http://192.168.0.254:8081/chat/chat", {
                     model: multiModelList![i].model,
                     parameters: multiModelList![i].parameters,
                     supplierName: multiModelList![i].supplierName,
@@ -116,6 +143,30 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
                     onDownloadProgress: (progressEvent: any) => {
                         // 获取当前接收到的部分响应数据
                         const currentResponse = progressEvent.event.currentTarget.responseText;
+                        // 增量解析 <mcptool>，派发 MCP 进度事件（按模型通道）
+                        try {
+                            const key = `${currentContextId.value}:${i}`
+                            const prevOffset = mcpStreamOffsets.value.get(key) || 0
+                            const chunk = currentResponse.slice(prevOffset)
+                            mcpStreamOffsets.value.set(key, currentResponse.length)
+                            const reg = /<mcptool>([\s\S]*?)<\/mcptool>/g
+                            let match: RegExpExecArray | null
+                            while ((match = reg.exec(chunk)) !== null) {
+                                const jsonStr = match[1].trim()
+                                try {
+                                    const obj = JSON.parse(jsonStr)
+                                    if (obj && obj.type === 'progress') {
+                                        chatToolsStore.appendMcpProgress(currentContextId.value, {
+                                            ts: Date.now(),
+                                            event: obj.event || obj.step || 'progress',
+                                            payload: obj
+                                        })
+                                    }
+                                } catch (_) {
+                                    // 忽略解析失败
+                                }
+                            }
+                        } catch (_) {}
                         // 防止切换带来的错误
                         if (currentTalkingChatId.value == currentContextId.value) {
                             const chat = chatHistory.value.get(currentChat!)

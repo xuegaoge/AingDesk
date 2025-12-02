@@ -47,6 +47,8 @@ export type AnswerInfo = {
     stat?: Stat | Stat[],
     search_result?: Array<{ content: string; link: string; title: string }>,
     tools_result?: Array<string>
+    // MCP 进度事件（后端保存的原始事件数组）
+    mcp_progress?: any[]
 
 }
 // 对话信息实体

@@ -40,6 +40,8 @@ export type ChatHistory = {
     search_type: string | undefined | null;
     search_query: string | undefined | null;
     tools_result?: any[];
+    // MCP 进度事件（流式）
+    mcp_progress?: any[];
 };
 
 /**

@@ -1,3 +1,132 @@
+<!-- OPENSPEC:START -->
+# OpenSpec Instructions
+
+These instructions are for AI assistants working in this project.
+
+Always open `@/openspec/AGENTS.md` when the request:
+- Mentions planning or proposals (words like proposal, spec, change, plan)
+- Introduces new capabilities, breaking changes, architecture shifts, or big performance/security work
+- Sounds ambiguous and you need the authoritative spec before coding
+
+Use `@/openspec/AGENTS.md` to learn:
+- How to create and apply change proposals
+- Spec format and conventions
+- Project structure and guidelines
+
+Keep this managed block so 'openspec update' can refresh the instructions.
+
+<!-- OPENSPEC:END -->
+
+# CLAUDE.md（重构版）
+
+此文件为 Claude Code（claude.ai/code）在本仓库工作时的权威指导，结合 Cherry Studio 实践与 AingDesk 工作空间约束，确保代理在本地与 MCP 环境下稳定运行与高质量改动。
+
+## 0. 工作空间硬约束（必须遵守）
+
+- 全局语言：所有思考过程与输出优先中文显示。
+- 包管理器：统一使用 Yarn（不使用 npm）。
+- 运行端口：
+  - 前端开发：http://localhost:5173（重新运行前请关闭 5173 端口占用）
+  - 后端开发：http://localhost:7071（重新运行前请关闭 7071 端口占用）
+- 日志路径：
+  - Claude Code 调试日志：`C:\Users\Administrator\.claude\debug`
+  - AingDesk 应用日志：`C:\AingDesk\logs`
+- 构建产物与源码：`public\electron\service` 为编译后产物，实际改动请在 `electron\service`（TS 源码）。禁止直接编辑构建产物。
+- MCP 配置：当前实际运行的 MCP 配置文件为 `C:\Users\Administrator\AppData\Roaming\AingDesk\data\mcp-server.json`。
+
+以上约束用于指导 Claude 的决策与工作流选择，任何偏离都必须记录理由并在 PR 中说明。
+
+## 1. 项目总览与技术栈
+
+AingDesk 是一个基于 Electron + Vite 的桌面 AI 应用，集成多模型、RAG、MCP 工具与工作流。与 Cherry Studio 同类场景下，本仓需兼容 MCP 的服务调用与 Claude Code 的技能（Skill）机制。
+
+- 主进程：Electron + TypeScript（Node.js 22+）
+- 渲染进程：Vue/React + TypeScript + Vite（当前前端运行端口 5173）
+- 状态管理：按现有实现（Redux 或其他）保持一致
+- UI 组件：遵循既有选择（本仓中 Vue/React 的 UI 方案）
+- 构建系统：Electron-Vite
+- 包管理器：Yarn 4.x / Yarn Workspaces（如有）
+
+## 2. 运行与开发命令（Yarn 优先）
+
+- 安装依赖：`yarn install`
+- 前端开发：`yarn dev`（URL: http://localhost:5173）
+- Electron 主进程开发：`yarn dev-electron`（URL: http://localhost:7071）
+- 调试模式：`yarn debug`（开启远程调试端口 9222）
+- 构建应用：`yarn build` / `yarn build-electron` / `yarn build-frontend`
+- 质量检查：`yarn build:check`（提交前必须通过）
+- 测试：`yarn test` / `yarn test:e2e`（Playwright）
+
+注意：如需重启任一开发服务，先释放对应端口占用，避免端口冲突导致服务异常。
+
+## 3. 目录与架构要点（AingDesk）
+
+- 禁止直接改动 `public\electron\service` 中的编译后 JS 文件；应在 `electron\service`（TypeScript 源码）中实现。
+- 主进程服务（示例）：`electron/service/*.ts`；前端入口：`frontend/src/main.ts`。
+- IPC 桥接：`electron/preload/*`；日志集中：通过统一 Logger。
+- MCP 控制器：`electron/controller/mcp.ts`；HTTP 接口：`electron/service/mcp.ts`、`electron/service/index.ts`。
+- OpenSpec：遇到架构/规则/模糊需求，先查阅 `@/openspec/AGENTS.md` 并按规范提出变更草案。
+
+## 4. Claude Code × MCP（工具与技能）约定
+
+为兼容 Claude Code 的 Skill 机制与 AingDesk MCP 服务，代理在执行 Skill 相关工具调用时应遵循以下策略（同时指导本仓内实现与提示）：
+
+- Skill 参数规范化：对 `Skill` 工具的 `tool_args` 中 `skill` 字段进行别名归一（如大小写、斜杠前缀等），避免因微小差异触发 `-32600` 或 Unknown Skill。
+- `list`/`help` 拦截：当 `skill` 为空或为 `list`/`help`（大小写/斜杠不敏感），优先在本地拦截输出“可用技能清单（available_skills）”，避免直连服务报错。输出格式应为：技能名、简述、所在位置/入口（例如：pdf, xlsx, docx, git-pushing, video-downloader, canvas-design）。
+- 错误中文降级：当工具返回 `Unknown skill` 或 `-32600`（无效请求）时，将错误降级为中文可读文本并给出下一步操作建议，而非直接抛异常。保持 push/text/raw 输出三通道一致的可读性。
+- 结果渲染规范：工具结果包含 `available_skills` 时，转换为清单型中文文本（技能名/描述/位置），并在前端正确展示。
+- 资源与文件：对于 DOCX 等“写前需读”的工具，遵循“自动读后写”桥接策略（先获取目标文件资源，再执行写入）。
+
+上述规范用于指导 Claude 的自动决策与本仓实现保持一致性，减少用户看到协议不兼容的原始错误。
+
+## 5. 日志与故障排除
+
+- Claude Code 调试：`C:\Users\Administrator\.claude\debug`（优先查看最近日志定位 Skill/工具调用问题）。
+- AingDesk 应用日志：`C:\AingDesk\logs`（ee-*.log / ee-error-*.log）。
+- 常见问题与建议：
+  - 端口占用：释放 5173/7071 后再启动对应服务。
+  - 构建产物误改：若改动了 `public\electron\service`，请回滚并在 `electron\service` 修改，随后 `yarn build-electron`。
+  - MCP 配置不生效：确认使用的是 `C:\Users\Administrator\AppData\Roaming\AingDesk\data\mcp-server.json`，并重启主进程使其生效。
+  - Unknown Skill/-32600：按第 4 节的中文降级策略提示用户并引导到 `list`/`help` 拦截输出。
+
+## 6. 开发规范（补充）
+
+- 中文优先：思考与输出全部中文；英文仅作为引用链接或代码片段中必要部分。
+- 不硬编码：能由模型决策与提示词解决的场景，优先写清“意图与边界”的系统/开发提示词。
+- UI 组件与风格：统一 i18n；提交前运行 `yarn build:check`。
+- 日志记录：统一 Logger，不使用 console.log；错误信息需带上下文并可定位。
+- 代码搜索：优先使用 ast-grep；其后才是 rg/grep；避免全局正则替换引入回归。
+
+## 7. 常见工作流（Claude 官方文档融合）
+
+- 代码修复或功能实现：自然语言描述 → Claude 定位相关代码 → 提议改动 → 运行测试 → 迭代直至通过。
+- 作为校验工具（linter/审查）：在脚本中加入 `claude -p 'custom prompt...'` 进行语义校验并产出统一格式报告。
+- 技能开发（Skills）：
+  - 个人技能：`~/.claude/skills/my-skill/SKILL.md`
+  - 项目技能：`code .claude/skills/my-skill/SKILL.md`
+  - 修改后需重启 Claude Code 以加载更新。
+
+## 8. 外部参考与链接
+
+- Claude Code 设置与工作流：
+  - https://code.claude.com/docs/zh-CN/setup
+  - https://code.claude.com/docs/zh-CN/quickstart
+  - https://code.claude.com/docs/zh-CN/skills
+  - https://code.claude.com/docs/zh-CN/common-workflows
+  - https://code.claude.com/docs/zh-CN/network-config
+
+## 9. 提交与版本
+
+- 语义化提交；更新类型定义；附带测试用例；必要时更新 i18n 键。
+- 构建发布：`yarn build:win/mac/linux`；开发构建 `yarn build:unpack`。
+
+## 10. 重要提醒（再次强调）
+
+- `public\electron\service` 是编译后生成的代码，不是实际的编译前代码；实际要修改的在 `electron\service`。
+- MCP 当前配置文件：`C:\Users\Administrator\AppData\Roaming\AingDesk\data\mcp-server.json`。
+- 所有运行服务与工具调用统一中文输出；Yarn 优先；日志路径如第 5 节。
+
+（完）
 # CLAUDE.md
 
 此文件为 Claude Code (claude.ai/code) 在此代码库中工作提供指导。

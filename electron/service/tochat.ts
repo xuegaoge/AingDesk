@@ -439,6 +439,7 @@ export class ToChatService {
             search_type: search,
             search_query: "",
             tools_result: [],
+            mcp_progress: [],
         };
         await chatService.save_chat_history(uuid, chatHistory, chatHistoryRes, modelInfo.contextLength, regenerate_id);
         await chatService.update_chat_config(uuid, "search_type", search);
@@ -527,9 +528,23 @@ export class ToChatService {
             read() { }
         });
         const PushOther = async (msg) => {
-            if (msg) {
-                s.push(msg);
-                if (msg.indexOf('<mcptool>') !== -1) {
+            if (!msg) return;
+            // 保持原有流式推送
+            s.push(msg);
+            // 解析 <mcptool> 包裹的 JSON，区分进度与结果
+            if (msg.indexOf('<mcptool>') !== -1) {
+                try {
+                    const jsonStr = msg.replace(/<mcptool>|<\/mcptool>/g, '').trim();
+                    const obj = JSON.parse(jsonStr);
+                    if (obj && obj.type === 'progress') {
+                        if (!Array.isArray(chatHistoryRes.mcp_progress)) chatHistoryRes.mcp_progress = [];
+                        chatHistoryRes.mcp_progress.push(obj);
+                    } else {
+                        // 默认视为工具结果
+                        chatHistoryRes.tools_result.push(msg);
+                    }
+                } catch (e) {
+                    // JSON 解析失败则保持原逻辑，写入 tools_result 便于前端回滚处理
                     chatHistoryRes.tools_result.push(msg);
                 }
             }
