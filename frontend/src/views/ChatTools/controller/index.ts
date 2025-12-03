@@ -81,7 +81,8 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
 
         if (!multiModelList) {
             // 单模型下发送对话
-            await axios.post("http://192.168.0.254:8081/chat/chat", {
+            await axios.post("http://127.0.0.1:7071/chat/chat", {
+            //await axios.post("http://192.168.0.254:8081/chat/chat", {
                 model,
                 parameters,
                 supplierName: currentSupplierName.value,
@@ -127,7 +128,8 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
         } else {
             
             for (let i = 0; i < multiModelList!.length; i++) {
-                const chatAxios = axios.post("http://192.168.0.254:8081/chat/chat", {
+                const chatAxios = axios.post("http://127.0.0.1:7071/chat/chat", {
+                //const chatAxios = axios.post("http://192.168.0.254:8081/chat/chat", {
                     model: multiModelList![i].model,
                     parameters: multiModelList![i].parameters,
                     supplierName: multiModelList![i].supplierName,
