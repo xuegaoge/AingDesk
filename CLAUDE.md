@@ -472,3 +472,28 @@ if (rag_list.length > 0) {
 - `electron/rag/rag.ts` - RAG 服务
 - `electron/controller/rag.ts` - RAG API 控制器
 - `electron/service/mcp_client.ts` - MCP 客户端
+
+## 11. 任务状态检查与重试 (check_status.js)
+
+为方便排查知识库解析任务状态及处理失败任务，项目中提供了 `check_status.js` 脚本工具。此工具独立运行，不依赖 Electron 环境，直接操作 LanceDB。
+
+### 使用方法
+
+确保在项目根目录运行：
+
+```bash
+# 1. 查看任务状态统计
+node check_status.js --check
+# 输出：各知识库的 total, queued, processing, embedding, completed, failed 数量
+
+# 2. 重试指定失败文件 (将状态重置为 0-Pending)
+node check_status.js --reprocess-file <docId>
+
+# 3. 重试所有失败文件 (仅针对 status = -1 的任务)
+# 重试所有知识库的失败任务
+node check_status.js --retry-failed
+# 仅重试指定知识库的失败任务
+node check_status.js --retry-failed <ragName>
+```
+
+**注意：** `--retry-failed` **仅会**重置状态为 `-1` (失败) 的任务，不会影响正在进行或已完成的任务，安全可靠。

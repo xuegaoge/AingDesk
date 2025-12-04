@@ -127,8 +127,31 @@ function handleFileChange() {
 /**
  * @description 点击按钮进行文件选择
  */
-function chooseFiles() {
-    fileUpload.value!.click()
+async function chooseFiles() {
+    if (uploadMode.value === 'dir') {
+        let folderPath: string | undefined;
+        try {
+            // @ts-ignore
+            const api = (window as any).electron?.ipcRenderer;
+            if (api && typeof api.invoke === 'function') {
+                folderPath = await api.invoke('controller.os.selectFolder');
+            }
+        } catch (e) {}
+
+        if (!folderPath) {
+            const input = window.prompt($t('请输入要导入的文件夹绝对路径，例如 C\\Data\\Docs')); 
+            if (input && input.trim()) {
+                folderPath = input.trim();
+            }
+        }
+
+        if (folderPath) {
+            chooseList.value = [{ name: folderPath, path: folderPath, isDir: true }];
+            fileOrDirList.value = [folderPath];
+        }
+    } else {
+        fileUpload.value!.click()
+    }
 }
 
 

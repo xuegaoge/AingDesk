@@ -259,8 +259,8 @@ export class Rag {
      * @param ragName:string rag名称
      * @returns Promise<any>
      */
-    public async parseDocument(filename: string,ragName:string,saveToFile?:boolean): Promise<any> {
-        return await parseDocument(filename,ragName,saveToFile);
+    public async parseDocument(filename: string,ragName:string,saveToFile?:boolean,customOutputFilename?:string): Promise<any> {
+        return await parseDocument(filename,ragName,saveToFile,customOutputFilename);
     }
 
 
@@ -433,6 +433,42 @@ export class Rag {
 
 
     /**
+     * 批量将文档添加到数据库
+     * @param fileList:Array<{filename: string, dstFile: string}> 文件列表
+     * @param ragName:string rag名称
+     * @returns Promise<any>
+     */
+    public async addDocumentsToDB(fileList: Array<{filename: string, dstFile: string}>, ragName:string, separators:string[], chunkSize:number, overlapSize:number): Promise<any> {
+        await this.createDocTable(this.docTable)
+        await this.checkDocTableSchema(this.docTable);
+
+        let dataDir = pub.get_data_path();
+        let repDataDir = '{DATA_DIR}';
+        
+        let records:any[] = [];
+        
+        for(let file of fileList){
+            records.push({
+                doc_id: pub.uuid(),
+                doc_name: path.basename(file.filename),
+                doc_file: file.dstFile.replace(dataDir, repDataDir),
+                md_file: '',
+                doc_rag: ragName,
+                doc_abstract: '',
+                doc_keywords: [],
+                is_parsed: 0,
+                update_time: pub.time(),
+                separators: separators,
+                chunk_size: chunkSize,
+                overlap_size: overlapSize,
+            });
+        }
+
+        return await LanceDBManager.addRecord(this.docTable, records);
+    }
+
+
+    /**
      * 将文档添加到数据库
      * @param filename:string 文件名
      * @param ragName:string rag名称
@@ -481,9 +517,19 @@ export class Rag {
     public async getRagInfo(ragName:string) {
         let ragConfigFile = path.resolve(pub.get_data_path(), 'rag',ragName, 'config.json');
         if (pub.file_exists(ragConfigFile)) {
-            let result =  JSON.parse(pub.read_file(ragConfigFile));
-            if (!result.supplierName) result.supplierName = 'ollama'
-            return result;
+            try {
+                let content = pub.read_file(ragConfigFile);
+                if (!content || content.trim() === '') {
+                    console.error(`[Rag.getRagInfo] Config file is empty: ${ragConfigFile}`);
+                    return null;
+                }
+                let result = JSON.parse(content);
+                if (!result.supplierName) result.supplierName = 'ollama'
+                return result;
+            } catch (e) {
+                console.error(`[Rag.getRagInfo] Failed to parse config for ${ragName}:`, e);
+                return null;
+            }
         }
         return null;
     }
@@ -605,9 +651,10 @@ export class Rag {
      * @returns Promise<any>
      */
     public async reindexDocument(ragName:string,docId: string): Promise<boolean> {
-        let docContentList = await LanceDBManager.queryRecord(this.docTable, "doc_id="+docId);
+        let docContentList = await LanceDBManager.queryRecord(this.docTable, "doc_id='"+docId+"'");
         if(docContentList.length>0){
-            await LanceDBManager.updateRecord(ragName,{where: `doc_id='${docId}'`,values: {is_parsed: 0}});
+            let docName = docContentList[0]?.doc_name || 'unknown';
+            await LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${docId}'`,values: {is_parsed: 0}}, docName);
 
         }
         return true;
@@ -620,7 +667,7 @@ export class Rag {
      * @returns Promise<any>
      */
     public async reindexRag(argName:string): Promise<boolean> {
-        await LanceDBManager.updateRecord(argName,{where: `doc_aag='${argName}'`,values: {is_parsed: 0}});
+        await LanceDBManager.updateRecord(this.docTable,{where: `doc_rag='${argName}'`,values: {is_parsed: 0}}, `RAG库:${argName}`);
         return true;
     }
 

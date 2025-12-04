@@ -511,14 +511,23 @@ export async function openDocUploadDialog() {
  * @description 上传知识库文档：手动上传
  */
 export async function uploadRagDocForManual() {
-	const { fileOrDirList, activeKnowledge, sliceChunkFormData } = getKnowledgeStoreData();
-	const { code, msg } = await post('/rag/upload_doc', {
+	const { fileOrDirList, activeKnowledge, sliceChunkFormData, uploadMode } = getKnowledgeStoreData();
+	let url = '/rag/upload_doc';
+	let params: any = {
 		ragName: activeKnowledge.value,
-		filePath: JSON.stringify(fileOrDirList.value),
 		separators: sliceChunkFormData.value.separators,
 		chunkSize: sliceChunkFormData.value.chunkSize,
 		overlapSize: sliceChunkFormData.value.overlapSize,
-	});
+	};
+
+	if (uploadMode.value === 'dir') {
+		url = '/rag/import_folder';
+		params.folderPath = fileOrDirList.value[0];
+	} else {
+		params.filePath = JSON.stringify(fileOrDirList.value);
+	}
+
+	const { code, msg } = await post(url, params);
 	if (code == 200) {
 		message.success(msg as string);
 		setTimeout(async () => {

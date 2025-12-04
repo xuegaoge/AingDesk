@@ -3,6 +3,7 @@ import { Lifecycle } from './preload/lifecycle';
 import { preload } from './preload';
 import { totalService } from './service/total';
 import mcp from './controller/mcp';
+import { logger } from 'ee-core/log';
 
 
 // New app
@@ -28,12 +29,20 @@ setTimeout(() => {
     shareService.startReconnect(socket,shareIdPrefix);
 
     // RAG后台任务
-    const { RagTask } = require('./rag/rag_task');
-    let ragTaskObj = new RagTask()
-    ragTaskObj.parseTask()
-
-    // 创建索引
-    ragTaskObj.switchToCosineIndex()
+    logger.info('[Startup] Initializing RagTask... (v2)');
+    try {
+        const { RagTask } = require('./rag/rag_task');
+        let ragTaskObj = new RagTask()
+        logger.info('[Startup] RagTask initialized. Starting parseTask...');
+        ragTaskObj.parseTask()
+        
+        // 创建索引
+        logger.info('[Startup] Starting switchToCosineIndex... (SKIPPED)');
+        // ragTaskObj.switchToCosineIndex()
+        logger.info('[Startup] RagTask setup complete.');
+    } catch (error) {
+        logger.error('[Startup] Error in RagTask initialization:', error);
+    }
 
     // 同步MCP服务器列表
     mcpService.sync_cloud_mcp()

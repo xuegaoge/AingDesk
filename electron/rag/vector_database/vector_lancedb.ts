@@ -66,7 +66,7 @@ export class LanceDBManager {
             }
             let oldSize = pub.getDirSize(dataPath);
             const db = await lancedb.connect(pub.get_db_path());
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
             await tableObj.optimize({
                 deleteUnverified:true,
                 cleanupOlderThan:new Date(),
@@ -253,33 +253,49 @@ export class LanceDBManager {
 
         try {
             let res:any;
-            if(supplierName == 'ollama'){
-                // 使用ollama服务
-                const ollama = pub.init_ollama();
-                res = await ollama.embeddings({
-                    model: model,
-                    prompt: text,
-                });
-            }else{
-                // 使用第三方模型服务
-                let modelService = new ModelService(supplierName);
-                res = await modelService.embedding(model,text);
-                modelService.destroy();
-                if(!res){
-                    throw new Error(modelService.error);
-                }
-            }
+            let lastError: any;
 
-            if (!res.embedding || res.embedding.length !== this.DIMENSION) {
-                if(!res.embedding){
-                    throw new Error(`嵌入维度错误: 期望 ${this.DIMENSION}, 实际 ${res.embedding ? res.embedding.length : 0}, 模型: ${model}, 文本: ${text}`);
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                    if(supplierName == 'ollama'){
+                        // 使用ollama服务
+                        const ollama = pub.init_ollama();
+                        res = await ollama.embeddings({
+                            model: model,
+                            prompt: text,
+                        });
+                    }else{
+                        // 使用第三方模型服务
+                        let modelService = new ModelService(supplierName);
+                        res = await modelService.embedding(model,text);
+                        modelService.destroy();
+                        if(!res){
+                            throw new Error(modelService.error);
+                        }
+                    }
+
+                    if (!res.embedding || res.embedding.length !== this.DIMENSION) {
+                        if(!res.embedding){
+                            throw new Error(`嵌入维度错误: 期望 ${this.DIMENSION}, 实际 ${res.embedding ? res.embedding.length : 0}, 模型: ${model}, 文本: ${text}`);
+                        }
+                        // 不足的维度以0填充
+                        if (res.embedding && res.embedding.length < this.DIMENSION) {
+                            const padding = new Array(this.DIMENSION - res.embedding.length).fill(0);
+                            res.embedding = res.embedding.concat(padding);
+                        }
+                    }
+                    
+                    // 成功获取嵌入，跳出重试循环
+                    break;
+                } catch (err) {
+                    lastError = err;
+                    if (attempt < 5) {
+                        logger.warn(`[LanceDB] 获取嵌入失败，正在重试 (${attempt}/5): ${err.message}`);
+                        await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+                    } else {
+                        throw err;
+                    }
                 }
-                // 不足的维度以0填充
-                if (res.embedding && res.embedding.length < this.DIMENSION) {
-                    const padding = new Array(this.DIMENSION - res.embedding.length).fill(0);
-                    res.embedding = res.embedding.concat(padding);
-                }
-                
             }
 
             // 设置缓存
@@ -470,7 +486,7 @@ export class LanceDBManager {
     public static async createDocFtsIndex(tableName:string){
         try{
             const db = await lancedb.connect(pub.get_db_path());
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
             
             let indexName = 'doc_idx'
             let indexStats = await tableObj.indexStats(indexName)
@@ -540,7 +556,7 @@ export class LanceDBManager {
             }
 
             // 打开表
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
 
 
@@ -622,7 +638,7 @@ export class LanceDBManager {
             }
 
             // 打开表
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 删除索引
             await tableObj.dropIndex(indexKey);
@@ -660,7 +676,7 @@ export class LanceDBManager {
                 db = await lancedb.connect(pub.get_db_path());
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 获取文本的嵌入
             const embedding = await this.getEmbedding(supplierName,model, text);
@@ -742,7 +758,7 @@ export class LanceDBManager {
                 throw new Error(`表 "${tableName}" 不存在`);
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
 
 
@@ -776,24 +792,63 @@ export class LanceDBManager {
      * @example
      * await LanceDBManager.updateRecord('test', { where:'id=1',values:{name:'test1',age:20} });
      */
-    public static async updateRecord(tableName: string, record: any): Promise<boolean> {
+    public static async updateRecord(tableName: string, record: any, logInfo?: string): Promise<boolean> {
+        const g: any = global as any;
+        if (tableName === 'doc_table') {
+            if (!g.docUpdateQueue) {
+                g.docUpdateQueue = Promise.resolve();
+            }
+            const prev = g.docUpdateQueue;
+            const next = prev.then(() => this.doUpdateRecord(tableName, record, logInfo));
+            g.docUpdateQueue = next.catch(() => {});
+            return await next;
+        }
+        return await this.doUpdateRecord(tableName, record, logInfo);
+    }
+
+    private static async doUpdateRecord(tableName: string, record: any, logInfo?: string): Promise<boolean> {
         const metrics = this.startMetrics(`更新文档到表 ${tableName}`);
         this.ensureDatabaseDirectory();
         const db = await lancedb.connect(pub.get_db_path());
-
         try {
-
-            // 检查表是否存在
             if (!(await this.tableExists(db, tableName))) {
                 return false;
-
             }
-            const tableObj = await db.openTable(tableName);
-
-            // 更新记录
-            await tableObj.update(record);
-            await tableObj.optimize();
-            logger.info(`成功更新文档到表 ${tableName}`);
+            let tableObj = await db.openTable(tableName);
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                    await tableObj.update(record);
+                    break;
+                } catch (err:any) {
+                    const msg = String(err?.message || err);
+                    if (msg.includes('concurrent commit') || msg.includes('conflict')) {
+                        logger.warn(`[LanceDB] 更新冲突，第 ${attempt} 次重试`, tableName, record);
+                        await new Promise(r => setTimeout(r, 200 + attempt * 200 + Math.floor(Math.random() * 200)));
+                        try { await tableObj.close(); } catch {}
+                        tableObj = await db.openTable(tableName);
+                        continue;
+                    }
+                    throw err;
+                }
+            }
+            let needOptimize = true;
+            if (tableName === 'doc_table') {
+                const now = Date.now();
+                const g: any = global as any;
+                if (!g.docTableOptimize) {
+                    g.docTableOptimize = { last: 0, count: 0 };
+                }
+                g.docTableOptimize.count++;
+                const last = g.docTableOptimize.last || 0;
+                needOptimize = (g.docTableOptimize.count % 50 === 0) || (now - last > 30000);
+                if (needOptimize) {
+                    g.docTableOptimize.last = now;
+                }
+            }
+            if (needOptimize) {
+            }
+            const msg = logInfo ? `成功更新-${logInfo} 到表 ${tableName}` : `成功更新文档到表 ${tableName}`;
+            logger.info(msg);
             return true;
         } catch (error: any) {
             logger.error(`更新文档失败: ${error.message}`,tableName,record);
@@ -822,7 +877,7 @@ export class LanceDBManager {
                 return false;
 
             }
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 删除记录
             await tableObj.delete(where);
@@ -856,7 +911,7 @@ export class LanceDBManager {
                 return [];
 
             }
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 查询记录
             let query = tableObj.query().where(where).limit(10000)
@@ -868,6 +923,28 @@ export class LanceDBManager {
         } catch (error: any) {
             logger.error(`查询文档失败: ${error.message}`);
             return [];
+        } finally {
+            await db.close();
+            this.endMetrics(metrics);
+        }
+    }
+
+    public static async queryCount(tableName: string, where: string): Promise<number> {
+        const metrics = this.startMetrics(`查询文档到表 ${tableName}`);
+        this.ensureDatabaseDirectory();
+        const db = await lancedb.connect(pub.get_db_path());
+
+        try {
+            if (!(await this.tableExists(db, tableName))) {
+                return 0;
+            }
+            let tableObj = await db.openTable(tableName);
+            let query = tableObj.query().where(where).select(['doc_id']).limit(10000000);
+            const results = await query.toArray();
+            return results.length;
+        } catch (error: any) {
+            logger.error(`查询文档失败: ${error.message}`);
+            return 0;
         } finally {
             await db.close();
             this.endMetrics(metrics);
@@ -890,7 +967,7 @@ export class LanceDBManager {
             if (!(await this.tableExists(db, tableName))) {
                 return 0;
             }
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 查询
             const results = await tableObj.countRows()
@@ -929,11 +1006,20 @@ export class LanceDBManager {
                 throw new Error(`表 "${tableName}" 不存在`);
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
-            // 优化: 并行处理嵌入生成
-            const embeddingPromises = texts.map(text => this.getEmbedding(supplierName,model, text));
-            const embeddings = await Promise.all(embeddingPromises);
+            // 受限并发处理嵌入生成，避免 CPU 饱和
+            const limit = 8;
+            const embeddings: number[] [] = [] as any;
+            let idx = 0;
+            while (idx < texts.length) {
+                // 给主线程喘息机会
+                await new Promise(r => setTimeout(r, 50));
+                const batch = texts.slice(idx, idx + limit);
+                const batchEmb = await Promise.all(batch.map(text => this.getEmbedding(supplierName,model, text)));
+                embeddings.push(...batchEmb);
+                idx += limit;
+            }
 
             // 创建记录数组
             const records: VectorRecord[] = embeddings.map((embedding, index) => ({
@@ -944,9 +1030,43 @@ export class LanceDBManager {
                 vector: embedding
             }));
 
-            // 批量添加记录
-            await tableObj.add(records);
-            await tableObj.optimize();
+            let added = false;
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                    await tableObj.add(records);
+                    added = true;
+                    break;
+                } catch (err:any) {
+                    const msg = String(err?.message || err);
+                    if (msg.includes('Commit conflict') || msg.includes('concurrent commit')) {
+                        await new Promise(r => setTimeout(r, 300 + attempt * 300));
+                        await tableObj.close();
+                        tableObj = await db.openTable(tableName);
+                        continue;
+                    }
+                    throw err;
+                }
+            }
+            if (!added) {
+                throw new Error('批量添加文档失败: 提交冲突重试超限');
+            }
+            
+            // 节流优化：每 10 次或 30 秒进行一次 optimize
+            // @ts-ignore
+            if (!global.vectorOptimize) {
+                // @ts-ignore
+                global.vectorOptimize = {};
+            }
+            // @ts-ignore
+            const info = global.vectorOptimize[tableName] || { last: 0, count: 0 };
+            const now = Date.now();
+            info.count++;
+            const needOptimize = (info.count % 10 === 0) || (now - info.last > 30000);
+            if (needOptimize) {
+                info.last = now;
+            }
+            // @ts-ignore
+            global.vectorOptimize[tableName] = info;
 
             // logger.info(`成功批量添加 ${records.length} 条文档到表 ${tableName}`);
             return records.length;
@@ -984,7 +1104,7 @@ export class LanceDBManager {
                 throw new Error(`表 "${tableName}" 不存在`);
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 获取查询文本的嵌入
             const embedding = await this.getEmbedding(supplierName,model, queryText);
@@ -1034,7 +1154,7 @@ export class LanceDBManager {
         this.ensureDatabaseDirectory();
 
         const db = await lancedb.connect(pub.get_db_path());
-        const tableObj = await db.openTable(tableName);
+        let tableObj = await db.openTable(tableName);
 
         const embedding = await this.getEmbedding(ragInfo.supplierName,ragInfo.embeddingModel, queryText);
 
@@ -1117,7 +1237,7 @@ export class LanceDBManager {
                 return [];
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
             
             // 预热查询以提高后续查询速度
             await this.preWarmQuery(tableObj);
@@ -1602,7 +1722,7 @@ export class LanceDBManager {
                 throw new Error(`表 "${tableName}" 不存在`);
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 获取所有记录
             const results = await tableObj
@@ -1638,7 +1758,7 @@ export class LanceDBManager {
                 throw new Error(`表 "${tableName}" 不存在`);
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
             return await tableObj.countRows();
         } catch (error: any) {
             throw new Error(`获取记录数量失败: ${error.message}`);
@@ -1719,7 +1839,7 @@ export class LanceDBManager {
                 throw new Error(`表 "${tableName}" 不存在`);
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 确认记录存在
             const where = "`docId` = '" + docId + "'";
@@ -1828,7 +1948,7 @@ export class LanceDBManager {
                 throw new Error(`表 "${tableName}" 不存在`);
             }
 
-            const tableObj = await db.openTable(tableName);
+            let tableObj = await db.openTable(tableName);
 
             // 预处理关键词
             const processedKeywords = caseSensitive

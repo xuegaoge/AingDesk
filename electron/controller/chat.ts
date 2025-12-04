@@ -92,7 +92,13 @@ class ChatController {
     async get_model_list(): Promise<any> {
         // 清空模型信息列表
         clearModelListInfo();
-        let ollamaModelList = await ollamaService.model_list()
+        let ollamaModelList: any[] = [];
+        try{
+            ollamaModelList = await ollamaService.model_list();
+        }catch(e){
+            logger.error(pub.lang('获取模型能力失败'), e);
+            ollamaModelList = [];
+        }
         try {
             // 获取所有模型信息
             MODEL_LIST_RETRY++;
