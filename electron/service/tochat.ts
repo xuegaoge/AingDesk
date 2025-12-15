@@ -439,6 +439,7 @@ export class ToChatService {
             search_type: search,
             search_query: "",
             tools_result: [],
+            mcp_progress: [],
         };
         await chatService.save_chat_history(uuid, chatHistory, chatHistoryRes, modelInfo.contextLength, regenerate_id);
         await chatService.update_chat_config(uuid, "search_type", search);
@@ -506,6 +507,17 @@ export class ToChatService {
                 requestOption.temperature = 0.6;
             }
         }
+        // 若前端未明确传入 mcp_servers，但本地存在已启用的MCP服务器，则默认启用，避免“有时不调用”的不一致
+        if (!mcp_servers || mcp_servers.length === 0) {
+            try {
+                const activeServers = await MCPClient.getActiveServers();
+                if (activeServers && activeServers.length > 0) {
+                    mcp_servers = activeServers.map(s => s.name);
+                }
+            } catch (e) {
+                // 忽略自动启用失败，保持原逻辑
+            }
+        }
         if (mcp_servers.length > 0) {
             isOllama = false;
         }
@@ -516,9 +528,23 @@ export class ToChatService {
             read() { }
         });
         const PushOther = async (msg) => {
-            if (msg) {
-                s.push(msg);
-                if (msg.indexOf('<mcptool>') !== -1) {
+            if (!msg) return;
+            // 保持原有流式推送
+            s.push(msg);
+            // 解析 <mcptool> 包裹的 JSON，区分进度与结果
+            if (msg.indexOf('<mcptool>') !== -1) {
+                try {
+                    const jsonStr = msg.replace(/<mcptool>|<\/mcptool>/g, '').trim();
+                    const obj = JSON.parse(jsonStr);
+                    if (obj && obj.type === 'progress') {
+                        if (!Array.isArray(chatHistoryRes.mcp_progress)) chatHistoryRes.mcp_progress = [];
+                        chatHistoryRes.mcp_progress.push(obj);
+                    } else {
+                        // 默认视为工具结果
+                        chatHistoryRes.tools_result.push(msg);
+                    }
+                } catch (e) {
+                    // JSON 解析失败则保持原逻辑，写入 tools_result 便于前端回滚处理
                     chatHistoryRes.tools_result.push(msg);
                 }
             }
@@ -535,7 +561,7 @@ export class ToChatService {
                 return;
             }
             if ((isOllama && chunk.done) ||
-                (!isOllama && (chunk.choices[0].finish_reason === 'stop' || chunk.choices[0].finish_reason === 'normal'))) {
+                (!isOllama && (['stop', 'normal', 'length', 'content_filter'].includes(chunk.choices[0]?.finish_reason)))) {
                 const resInfo = getResponseInfo(chunk, isOllama, modelStr, resTimeMs);
                 chatHistoryRes.created_at = chunk.created_at ? chunk.created_at.toString() : chunk.created;
                 chatHistoryRes.create_time = chunk.created ? chunk.created : pub.time();

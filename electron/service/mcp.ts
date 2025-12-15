@@ -304,22 +304,31 @@ class McpService {
      * @returns {Promise<any>} - 返回同步结果
      */
     async sync_cloud_mcp(){
-        let downloadUrl = `https://aingdesk.bt.cn/config/common-mcp-server.json`;
-        let res = await pub.httpRequest(downloadUrl)
-        
-        if(res.statusCode !== 200){
+        try{
+            let downloadUrl = `https://aingdesk.bt.cn/config/common-mcp-server.json`;
+            let res = await pub.httpRequest(downloadUrl);
+
+            if(!res || res.statusCode !== 200){
+                return pub.return_error(pub.lang('获取失败'));
+            }
+
+            let commonMcpConfig = res.body;
+            if(typeof commonMcpConfig === 'string'){
+                try{
+                    commonMcpConfig = JSON.parse(commonMcpConfig);
+                }catch(e){
+                    return pub.return_error(pub.lang('配置文件格式错误'));
+                }
+            }
+            if(!commonMcpConfig || !commonMcpConfig.mcpServers){
+                return pub.return_error(pub.lang('配置文件格式错误'));
+            }
+            mcpService.save_common_mcp_config(commonMcpConfig);
+            return pub.return_success(pub.lang('同步成功'));
+        }catch(e){
+            logger.error('sync_cloud_mcp failed:', e);
             return pub.return_error(pub.lang('获取失败'));
         }
-        
-        let commonMcpConfig = res.body;
-        if(typeof commonMcpConfig === 'string'){
-            commonMcpConfig = JSON.parse(commonMcpConfig);
-        }
-        if(!commonMcpConfig.mcpServers){
-            return pub.return_error(pub.lang('配置文件格式错误'));
-        }
-        mcpService.save_common_mcp_config(commonMcpConfig);
-        return pub.return_success(pub.lang('同步成功'));
     }
 
 }

@@ -1,5 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { spawn } from 'child_process';
 
 /**
  * PPT解析器类
@@ -115,21 +116,85 @@ export class PptxParser {
  * @param filename PPT文件路径
  * @returns Markdown格式的字符串
  */
-export async function parse(filename: string): Promise<string> {
-  try {
-    // 检查文件扩展名
-    const ext = path.extname(filename).toLowerCase();
-
-    if (ext === '.pptx') {
-      const parser = new PptxParser();
-      return await parser.ppt2md(filename);
-    } else if (ext === '.ppt') {
-      return `# 不支持的文件格式\n\n很抱歉，目前仅支持.pptx格式的PowerPoint文件解析。`;
-    } else {
-      return `# 不支持的文件格式\n\n文件 ${path.basename(filename)} 不是有效的PowerPoint文件。`;
-    }
-  } catch (error: any) {
-    console.error('解析PPT文件失败:', error);
-    return `# PPT解析失败\n\n无法解析PowerPoint文件。错误: ${error.message || '未知错误'}`;
+export async function parse(filename: string, ragName: string): Promise<string> {
+  let scriptPath = __filename;
+  if (path.extname(scriptPath) === '.ts') {
+      // 开发环境：指向编译后的 JS 文件
+      scriptPath = path.join(process.cwd(), 'public', 'electron', 'rag', 'doc_engins', 'libs', 'ppt_parse.js');
   }
+
+  return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [scriptPath, filename, ragName], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+      });
+
+      let stdoutData = '';
+      let stderrData = '';
+
+      child.stdout.on('data', (data) => {
+          stdoutData += data.toString();
+      });
+
+      child.stderr.on('data', (data) => {
+          stderrData += data.toString();
+      });
+
+      child.on('close', (code) => {
+          if (code !== 0) {
+              console.error(`[PptParse] Process exited with code ${code}`);
+              console.error(`[PptParse] Stderr: ${stderrData}`);
+              resolve(''); 
+              return;
+          }
+
+          try {
+              const result = JSON.parse(stdoutData);
+              if (result.success) {
+                  resolve(result.data);
+              } else {
+                  console.error(`[PptParse] Worker reported error: ${result.error}`);
+                  resolve('');
+              }
+          } catch (error: any) {
+              console.error(`[PptParse] Failed to parse worker output: ${stdoutData}`);
+              resolve('');
+          }
+      });
+
+      child.on('error', (error) => {
+          console.error(`[PptParse] Failed to spawn worker: ${error}`);
+          resolve('');
+      });
+  });
+}
+
+if (require.main === module) {
+  (async () => {
+      const filename = process.argv[2];
+      const ragName = process.argv[3];
+
+      if (!filename) {
+          console.error('Usage: node ppt_parse.js <filename> [ragName]');
+          process.exit(1);
+      }
+
+      try {
+        // 检查文件扩展名
+        const ext = path.extname(filename).toLowerCase();
+        let result = '';
+
+        if (ext === '.pptx') {
+          const parser = new PptxParser();
+          result = await parser.ppt2md(filename);
+        } else if (ext === '.ppt') {
+          result = `# 不支持的文件格式\n\n很抱歉，目前仅支持.pptx格式的PowerPoint文件解析。`;
+        } else {
+          result = `# 不支持的文件格式\n\n文件 ${path.basename(filename)} 不是有效的PowerPoint文件。`;
+        }
+        process.stdout.write(JSON.stringify({ success: true, data: result }));
+      } catch (error: any) {
+          process.stdout.write(JSON.stringify({ success: false, error: error.message || '未知错误' }));
+      }
+  })();
 }

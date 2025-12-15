@@ -420,6 +420,146 @@ class RagController {
 
 
     /**
+     * 递归扫描文件
+     */
+    private scanFiles(dir: string, fileList: string[] = []) {
+        const files = fs.readdirSync(dir);
+        const SUPPORTED_EXTS = [
+            '.docx', '.doc', '.xlsx', '.xls', '.csv', '.pptx', '.ppt', '.pdf', 
+            '.html', '.htm', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', 
+            '.md', '.markdown', '.txt', '.log', '.text', '.conf', '.cfg', '.ini', '.json'
+        ];
+
+        files.forEach(file => {
+            const filePath = path.join(dir, file);
+            const stat = fs.statSync(filePath);
+            if (stat.isDirectory()) {
+                this.scanFiles(filePath, fileList);
+            } else {
+                if (SUPPORTED_EXTS.includes(path.extname(file).toLowerCase())) {
+                    fileList.push(filePath);
+                }
+            }
+        });
+        return fileList;
+    }
+
+    /**
+     * 导入文件夹（服务端扫描模式）
+     * @param {string} ragName - 知识库名称
+     * @param {string} folderPath - 文件夹路径
+     * @returns {Promise<any>}
+     */
+    async import_folder(args: { ragName: string, folderPath: string, separators?: string[], chunkSize?: number, overlapSize?: number }): Promise<any> {
+        let { ragName, folderPath, separators, chunkSize, overlapSize } = args;
+
+        // 检查参数
+        if (!ragName) return pub.return_error(pub.lang('知识库名称不能为空'));
+        if (ragName == 'vector_db') return pub.return_error(pub.lang('知识库名称不能为vector_db'));
+        if (!folderPath) return pub.return_error(pub.lang('文件夹路径不能为空'));
+        if (!pub.file_exists(folderPath)) return pub.return_error(pub.lang('文件夹不存在'));
+
+        // 默认参数处理
+        if (!separators) separators = [];
+        if (!chunkSize) chunkSize = 1000;
+        if (!overlapSize) overlapSize = 100;
+        if (typeof separators == 'string') separators = [separators];
+
+        // 知识库路径
+        const ragPath = pub.get_rag_path() + "/" + ragName;
+        if (!pub.file_exists(ragPath)) return pub.return_error(pub.lang('知识库不存在'));
+
+        // 更新配置
+        const ragDescFile = ragPath + "/config.json";
+        if (pub.file_exists(ragDescFile)) {
+            let ragConfig = pub.read_json(ragDescFile);
+            ragConfig.separators = separators;
+            ragConfig.chunkSize = chunkSize;
+            ragConfig.overlapSize = overlapSize;
+            pub.write_json(ragDescFile, ragConfig);
+        }
+
+        // 1. 扫描文件
+        let files: string[] = [];
+        try {
+            files = this.scanFiles(folderPath);
+        } catch (e: any) {
+            return pub.return_error(pub.lang('扫描文件夹失败: {}', e.message));
+        }
+
+        if (files.length === 0) {
+            return pub.return_error(pub.lang('该文件夹下没有支持的文件'));
+        }
+
+        // 2. 批量处理文件复制和准备入库数据
+        const ragObj = new Rag();
+        const batchSize = 50; // 每次处理50个文件的复制，避免IO拥堵
+        let successCount = 0;
+        
+        // 准备批量插入的数据
+        let dbInsertList: Array<{filename: string, dstFile: string}> = [];
+
+        for (let i = 0; i < files.length; i += batchSize) {
+            const batch = files.slice(i, i + batchSize);
+            
+            // 并发复制文件
+            await Promise.all(batch.map(async (srcFile) => {
+                try {
+                    const fileName = path.basename(srcFile);
+                    // 使用时间戳+随机数防止重名，而不是循环检查文件是否存在（循环检查在大量文件时极慢）
+                    // 或者保留原名，但加上uuid前缀
+                    const ext = path.extname(srcFile);
+                    const nameNoExt = path.basename(srcFile, ext);
+                    // 简单的防重名策略：如果目标存在，加UUID。
+                    // 但为了保持原文件名可读性，我们尽量保留原名。
+                    // 考虑到数万文件，每次都 check file_exists 可能会慢。
+                    // 但如果不 check，直接覆盖可能不安全。
+                    // 优化策略：直接用 UUID 作为存储文件名，数据库里存原始文件名。
+                    // 但 Rag 系统似乎依赖文件名来做一些事情？查看 rag_task.ts，它用 doc_file 来解析。
+                    // 现有的 upload_doc 逻辑是：
+                    // let i = 1; while(exists) { ... i++ }
+                    // 这在大量重复文件名时是灾难。
+                    
+                    // 改进：使用 UUID + 扩展名 作为磁盘文件名，确保唯一且无需检查
+                    // 或者：hash(fullpath) + ext
+                    const safeFileName = `${pub.uuid()}${ext}`; 
+                    const dstFile = path.join(ragPath, 'source', safeFileName);
+                    
+                    // 异步复制
+                    await fs.promises.copyFile(srcFile, dstFile);
+                    
+                    // 记录到列表，准备插入数据库
+                    // 注意：这里我们用 safeFileName 作为磁盘文件，但在数据库 doc_name 字段最好存原始文件名以便展示
+                    // 修改 addDocumentsToDB 的逻辑？
+                    // addDocumentsToDB 使用 path.basename(file.filename) 作为 doc_name
+                    // 所以我们需要传原始文件名给 filename，传 safeFileName 的全路径给 dstFile
+                    dbInsertList.push({
+                        filename: srcFile, // 原始路径，用于提取 doc_name
+                        dstFile: dstFile   // 实际存储路径
+                    });
+                    
+                    successCount++;
+                } catch (e) {
+                    console.error(`Copy file error: ${srcFile}`, e);
+                }
+            }));
+        }
+
+        // 3. 批量插入数据库
+        if (dbInsertList.length > 0) {
+            // 分批插入数据库，避免一次性构建过大的 SQL/JSON
+            const dbBatchSize = 500;
+            for (let i = 0; i < dbInsertList.length; i += dbBatchSize) {
+                const batch = dbInsertList.slice(i, i + dbBatchSize);
+                await ragObj.addDocumentsToDB(batch, ragName, separators, chunkSize, overlapSize);
+            }
+        }
+
+        return pub.return_success(pub.lang('成功导入 {} 个文件到处理队列', successCount));
+    }
+
+
+    /**
      * 获取知识库文档列表
      * @param {string} ragName - 知识库名称
      * @returns {Promise<any>} - 文件列表
@@ -762,6 +902,20 @@ class RagController {
         let ragObj = new Rag();
         let result = await ragObj.getDocChunkList(args.ragName, args.docId);
         return pub.return_success(pub.lang('操作成功'), result);
+    }
+
+    /**
+     * 清除未完成的任务队列
+     * @returns {Promise<any>}
+     */
+    async clear_queue(): Promise<any> {
+        let ragTask = new RagTask();
+        let result = await ragTask.clearTaskQueue();
+        if (result) {
+            return pub.return_success(pub.lang('任务队列已清除'));
+        } else {
+            return pub.return_error(pub.lang('清除任务队列失败'));
+        }
     }
 }
 

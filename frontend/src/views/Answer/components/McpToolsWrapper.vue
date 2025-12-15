@@ -27,23 +27,50 @@ const props = defineProps<{ content: string }>()
 const mcpToolContent = computed(() => {
     return JSON.parse(props.content.replace(/<mcptool>|<\/mcptool>/g, '').trim())
 })
+// 错误文本判定（扩充常见 MCP/Claude Code 错误提示）
+const errorPatterns = [
+    /invalid/i,
+    /File does not exist/i,
+    /EISDIR/i,
+    /illegal operation/i,
+    /Error:/i,
+    /has not been read yet/i,
+    /Read it first/i,
+    /未读取/i,
+    /请先读取/i
+]
+
+function isErrorText(txt: string) {
+    return errorPatterns.some(r => r.test(txt))
+}
+
+const filteredResults = computed(() => {
+    const results = Array.isArray(mcpToolContent.value.tool_result) ? mcpToolContent.value.tool_result : []
+    // 仅展示“最新一次”的工具结果，避免出现错误时回退展示历史成功结果导致的页面信息陈旧问题
+    if (results.length > 0) {
+        return [results[results.length - 1]]
+    }
+    return []
+})
+
 const preCOntent = computed(() => {
-    const resStrList = []
-    for (let i = 0; i < mcpToolContent.value.tool_result.length; i++) {
-        if (mcpToolContent.value.tool_result[i].type == "text") {
+    const resStrList: string[] = []
+    const items = filteredResults.value
+    for (let i = 0; i < items.length; i++) {
+        const itm = items[i]
+        if (itm.type == "text") {
             try {
-                const parRes = JSON.parse(mcpToolContent.value.tool_result[i].text)
+                const parRes = JSON.parse(itm.text)
                 resStrList.push(JSON.stringify(parRes, null, 4))
             } catch (error) {
-                resStrList.push(mcpToolContent.value.tool_result[i].text)
+                resStrList.push(itm.text)
             }
         } else {
-            resStrList.push(mcpToolContent.value.tool_result[i])
+            resStrList.push(JSON.stringify(itm))
         }
     }
-    return resStrList.join('\n')
-
-
+    // 去重同内容（仅保留一次）
+    return Array.from(new Set(resStrList)).join('\n')
 })
 const isClose = ref(true)
 const wrapperRef = ref()

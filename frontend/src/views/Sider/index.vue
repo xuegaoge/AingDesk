@@ -4,7 +4,7 @@
         <div class="logo">
             <div class=logo-left>
                 <n-image :src="logo" object-fit="cover" class="h-30" preview-disabled />
-                <span class="text-[var(--bt-tit-color-secondary)]">AingDesk</span>
+                <span class="text-[var(--bt-tit-color-secondary)]">亿级卖家智库系统V1.1</span>
             </div>
             <div>
                 <i class="i-common:fold w-18 h-18  cursor-pointer" @click="doFold"></i>

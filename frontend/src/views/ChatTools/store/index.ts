@@ -2,8 +2,14 @@ import type { McpServerListDto } from "@/views/Home/dto";
 import { defineStore, storeToRefs } from "pinia";
 import { ref } from "vue";
 
+// MCP 进度事件结构
+export type McpProgressEvent = {
+    ts: number
+    event: string
+    payload?: any
+}
 
-const useChatToolsStore = defineStore("chatTools", () => {
+export const useChatToolsStore = defineStore("chatTools", () => {
     // 根据模型状态确定当前对话是否可用
     const chatMask = ref({
         status: false,
@@ -33,6 +39,44 @@ const useChatToolsStore = defineStore("chatTools", () => {
     const mcpListChoosed = ref<string[]>([])
     // 多模型对话的唯一id
     const compare_id = ref<string>("")
+
+    // MCP 进度：按对话ID聚合
+    const mcpProgress = ref<Map<string, McpProgressEvent[]>>(new Map())
+    // 流式解析偏移：避免重复解析，key 采用 `${contextId}:${channel}`
+    const mcpStreamOffsets = ref<Map<string, number>>(new Map())
+
+    // 追加进度事件
+    function appendMcpProgress(chatId: string, evt: McpProgressEvent) {
+        const list = mcpProgress.value.get(chatId) || []
+        list.push(evt)
+        mcpProgress.value.set(chatId, list)
+    }
+
+    // 重置当前对话的进度事件与偏移
+    function resetMcpProgress(chatId: string) {
+        mcpProgress.value.set(chatId, [])
+        // 清除所有 channel 偏移（single/multi）
+        for (const key of mcpStreamOffsets.value.keys()) {
+            if (key.startsWith(`${chatId}:`)) {
+                mcpStreamOffsets.value.delete(key)
+            }
+        }
+    }
+
+    // 启动时或页面刷新后的进度复原（hydration）
+    function hydrateMcpProgress(chatId: string, events: McpProgressEvent[]) {
+        try {
+            const list: McpProgressEvent[] = Array.isArray(events) ? events.map((e: any) => ({
+                ts: typeof e.ts === 'number' ? e.ts : Date.now(),
+                event: e.event || e.step || 'progress',
+                payload: e
+            })) : []
+            mcpProgress.value.set(chatId, list)
+        } catch (_) {
+            // 静默处理，避免影响页面加载
+            mcpProgress.value.set(chatId, [])
+        }
+    }
     return {
         chatMask,
         questionContent,
@@ -46,7 +90,12 @@ const useChatToolsStore = defineStore("chatTools", () => {
         netActive,
         mcpListForChat,
         mcpListChoosed,
-        compare_id
+        compare_id,
+        mcpProgress,
+        mcpStreamOffsets,
+        appendMcpProgress,
+        resetMcpProgress,
+        hydrateMcpProgress
     }
 })
 

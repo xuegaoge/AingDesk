@@ -12,7 +12,7 @@ import { getSiderStoreData } from "@/views/Sider/store"
 import { getChatContentStoreData } from "@/views/ChatContent/store"
 import { getKnowledgeStoreData } from "@/views/KnowleadgeStore/store"
 import { getAgentStoreData } from "@/views/Agent/store"
-import { getChatToolsStoreData } from "../store"
+import { getChatToolsStoreData, useChatToolsStore } from "../store"
 import { getHeaderStoreData } from "@/views/Header/store"
 import { getSoftSettingsStoreData } from "@/views/SoftSettings/store"
 import { getThirdPartyApiStoreData } from "@/views/ThirdPartyApi/store"
@@ -36,9 +36,10 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
     const { targetNet, } = getSoftSettingsStoreData()
     const { currentTalkingChatId, isInChat, chatHistory, } = getChatContentStoreData()
     const { activeKnowledgeForChat, } = getKnowledgeStoreData()
-    const { netActive, temp_chat, mcpListChoosed } = getChatToolsStoreData()
+    const { netActive, temp_chat, mcpListChoosed, mcpStreamOffsets } = getChatToolsStoreData()
     const { currentSupplierName } = getThirdPartyApiStoreData()
     const { compare_id } = getChatToolsStoreData()
+    const chatToolsStore = useChatToolsStore()
     const chatAxiosArr = []
 
     /********** 单模型及多模型下的ollama处理 ***********/
@@ -68,6 +69,8 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
             await create_chat()
         }
         currentTalkingChatId.value = currentContextId.value
+        // 重置当前对话的 MCP 进度（避免上一次残留）
+        chatToolsStore.resetMcpProgress(currentContextId.value)
         // 找到当前对话的记录
         let currentChat: null | MultipeQuestionDto = null;
         for (let [key] of chatHistory.value) {
@@ -88,7 +91,7 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
                 temp_chat: String(temp_chat.value),
                 mcp_servers: mcpListChoosed.value,
                 ...params
-            }, currentChat, chatHistory)
+            }, currentChat, chatHistory, 'single')
         } else {
 
             for (let i = 0; i < multiModelList!.length; i++) {
@@ -103,7 +106,7 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
                     mcp_servers: mcpListChoosed.value,
                     compare_id: compare_id.value,
                     ...params
-                }, currentChat, chatHistory)
+                }, currentChat, chatHistory, String(i))
 
                 chatAxiosArr.push(chatAxios)
             }
@@ -135,7 +138,7 @@ export async function sendChat(params: ChatParams, multiModelList?: Array<Multip
  * @param currentChat 当前聊天记录
  * @param chatHistory 聊天历史存储
  */
-async function sendStreamChat(params: any, currentChat: MultipeQuestionDto | null, chatHistory: any) {
+async function sendStreamChat(params: any, currentChat: MultipeQuestionDto | null, chatHistory: any, streamKey?: string) {
     return new Promise<void>((resolve, reject) => {
         const baseURL = import.meta.env.VITE_BASE_URL
         const url = `${baseURL}/chat/chat`
@@ -165,13 +168,39 @@ async function sendStreamChat(params: any, currentChat: MultipeQuestionDto | nul
                         if (typeof chat.content === 'string') {
                             chat.content = fullResponse
                         } else if (Array.isArray(chat.content)) {
-                            // 多模型情况
-                            chat.content[0] = fullResponse
+                            const idx = streamKey !== undefined ? Number(streamKey) || 0 : 0
+                            chat.content[idx] = fullResponse
                         }
                     }
                     // 关键：替换整个 Map 来触发 Vue 响应式系统
                     chatHistory.value = newMap
                 }
+
+                // 增量解析 <mcptool>，派发 MCP 进度事件
+                try {
+                    const { currentContextId } = getSiderStoreData()
+                    const { mcpStreamOffsets } = getChatToolsStoreData()
+                    const chatToolsStore = useChatToolsStore()
+                    const key = `${currentContextId.value}:${streamKey ?? 'single'}`
+                    const prevOffset = mcpStreamOffsets.value.get(key) || 0
+                    const chunk = fullResponse.slice(prevOffset)
+                    mcpStreamOffsets.value.set(key, fullResponse.length)
+                    const reg = /<mcptool>([\s\S]*?)<\/mcptool>/g
+                    let match: RegExpExecArray | null
+                    while ((match = reg.exec(chunk)) !== null) {
+                        const jsonStr = match[1].trim()
+                        try {
+                            const obj = JSON.parse(jsonStr)
+                            if (obj && obj.type === 'progress') {
+                                chatToolsStore.appendMcpProgress(currentContextId.value, {
+                                    ts: Date.now(),
+                                    event: obj.event || (obj.step as any) || 'progress',
+                                    payload: obj
+                                })
+                            }
+                        } catch (_) {}
+                    }
+                } catch (_) {}
             }
         }
 
@@ -183,7 +212,8 @@ async function sendStreamChat(params: any, currentChat: MultipeQuestionDto | nul
                     const newMap = new Map(chatHistory.value)
                     const chat = newMap.get(currentChat)
                     if (chat) {
-                        finalUpdateChatContent(chat, fullResponse || xhr.responseText)
+                        const idx = streamKey !== undefined ? Number(streamKey) || 0 : undefined
+                        finalUpdateChatContent(chat, fullResponse || xhr.responseText, idx)
                     }
                     // 关键：替换整个 Map 来触发 Vue 响应式系统
                     chatHistory.value = newMap
@@ -213,11 +243,12 @@ async function sendStreamChat(params: any, currentChat: MultipeQuestionDto | nul
 /**
  * 辅助函数：最终确认更新聊天内容
  */
-function finalUpdateChatContent(chat: any, content: string) {
+function finalUpdateChatContent(chat: any, content: string, idx?: number) {
     if (typeof chat.content === 'string') {
         chat.content = content
     } else if (Array.isArray(chat.content)) {
-        chat.content[0] = content
+        const i = typeof idx === 'number' ? idx : 0
+        chat.content[i] = content
     }
 }
 

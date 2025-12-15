@@ -300,12 +300,15 @@ class Public {
             }
         }
 
-        // 获取用户数据目录
-        let data_path = path.resolve(this.get_root_path(),'data');
-        
-        // 如果不存在则创建
+        // 优先使用用户数据目录
+        let data_path = path.resolve(this.get_user_data_path(),'data');
         if (!fs.existsSync(data_path)) {
-            data_path = path.resolve(this.get_user_data_path(),'data');
+            fs.mkdirSync(data_path);
+        }
+        
+        // 兼容旧行为：若用户数据目录不可用，则回退到根目录
+        if (!fs.existsSync(data_path)) {
+            data_path = path.resolve(this.get_root_path(),'data');
             if (!fs.existsSync(data_path)) {
                 fs.mkdirSync(data_path);
             }

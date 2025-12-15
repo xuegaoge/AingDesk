@@ -4,12 +4,57 @@ import { Rag } from './rag';
 import {indexService} from '../service/index'
 import { logger } from 'ee-core/log';
 import path from 'path';
-
+import { execSync } from 'child_process';
+import iconv from 'iconv-lite';
+import fs from 'fs';
 
 
 export class RagTask {
     private docTable = 'doc_table';
+    private initialized = false;
+    private consoleEncoding: string | null = null;
 
+
+    /**
+     * 重置卡住的任务
+     * 启动时调用，将所有状态为1 (处理中) 的任务重置为 0 (待处理)，以便重新尝试
+     */
+    public async resetStuckTasks() {
+        logger.info('[RagTask] Checking for stuck tasks (is_parsed=1)...');
+        try {
+            const stuckDocs = await LanceDBManager.queryRecord(this.docTable, "is_parsed=1");
+            if (stuckDocs && stuckDocs.length > 0) {
+                logger.warn(`[RagTask] Found ${stuckDocs.length} stuck tasks. Resetting to pending state.`);
+                for (const doc of stuckDocs) {
+                    logger.warn(`[RagTask] Resetting stuck task: ${path.basename(doc.doc_file || 'unknown')} (${doc.doc_id})`);
+                    await LanceDBManager.updateRecord(this.docTable, {
+                        where: `doc_id='${doc.doc_id}'`,
+                        values: { is_parsed: 0 }
+                    }, path.basename(doc.doc_file || 'unknown'));
+                }
+            } else {
+                logger.info('[RagTask] No stuck tasks found.');
+            }
+        } catch (error) {
+            logger.error('[RagTask] Error resetting stuck tasks:', error);
+        }
+    }
+
+    /**
+     * 清除未完成的任务队列
+     */
+    public async clearTaskQueue() {
+        logger.info('[RagTask] Clearing task queue (is_parsed != 3)...');
+        try {
+            // is_parsed != 3 means not finished (0=pending, 1=processing, 2=embedding, -1=failed)
+            await LanceDBManager.deleteRecord(this.docTable, "is_parsed != 3");
+            logger.info('[RagTask] Task queue cleared.');
+            return true;
+        } catch (error) {
+            logger.error('[RagTask] Error clearing task queue:', error);
+            return false;
+        }
+    }
 
     /**
      * 获取未解析文档
@@ -17,12 +62,96 @@ export class RagTask {
      */
     async getNotParseDocument(): Promise<any> {
         let result = await LanceDBManager.queryRecord(this.docTable, "is_parsed=0");
+        if (result && result.length > 0) {
+            const dataDir = pub.get_data_path();
+            const repDataDir = '{DATA_DIR}';
+            result.sort((a: any, b: any) => {
+                let aSize = 0;
+                let bSize = 0;
+                try {
+                    const aFile = a.doc_file.replace(repDataDir, dataDir);
+                    aSize = fs.statSync(aFile).size / (1024 * 1024);
+                } catch (e) { aSize = 0; }
+                try {
+                    const bFile = b.doc_file.replace(repDataDir, dataDir);
+                    bSize = fs.statSync(bFile).size / (1024 * 1024);
+                } catch (e) { bSize = 0; }
+
+                const aIsLarge = aSize > 50;
+                const bIsLarge = bSize > 50;
+
+                if (aIsLarge && !bIsLarge) return 1;
+                if (!aIsLarge && bIsLarge) return -1;
+                return aSize - bSize;
+            });
+        }
         return result;
     }
 
     async getNotEmbeddingDocument(): Promise<any> {
         let result = await LanceDBManager.queryRecord(this.docTable, "is_parsed=2");
+        if (result && result.length > 0) {
+            const dataDir = pub.get_data_path();
+            const repDataDir = '{DATA_DIR}';
+            result.sort((a: any, b: any) => {
+                let aSize = 0;
+                let bSize = 0;
+                try {
+                    const aFile = a.md_file ? a.md_file.replace(repDataDir, dataDir) : '';
+                    if (aFile && fs.existsSync(aFile)) {
+                        aSize = fs.statSync(aFile).size / (1024 * 1024);
+                    }
+                } catch (e) { aSize = 0; }
+                
+                try {
+                    const bFile = b.md_file ? b.md_file.replace(repDataDir, dataDir) : '';
+                    if (bFile && fs.existsSync(bFile)) {
+                        bSize = fs.statSync(bFile).size / (1024 * 1024);
+                    }
+                } catch (e) { bSize = 0; }
+
+                const aIsLarge = aSize > 50;
+                const bIsLarge = bSize > 50;
+
+                if (aIsLarge && !bIsLarge) return 1;
+                if (!aIsLarge && bIsLarge) return -1;
+                return aSize - bSize;
+            });
+        }
         return result;
+    }
+
+    private getConsoleEncoding() {
+        if (this.consoleEncoding) return this.consoleEncoding;
+        if (process.platform === 'win32') {
+            try {
+                const output = execSync('chcp').toString();
+                if (output.includes('936')) {
+                    this.consoleEncoding = 'gbk';
+                } else {
+                    this.consoleEncoding = 'utf-8';
+                }
+            } catch (e) {
+                this.consoleEncoding = 'utf-8';
+            }
+        } else {
+            this.consoleEncoding = 'utf-8';
+        }
+        return this.consoleEncoding;
+    }
+
+    private logToTerminal(msg: string) {
+        const encoding = this.getConsoleEncoding();
+        if (encoding === 'gbk') {
+            try {
+                const buf = iconv.encode(msg + '\n', 'gbk');
+                process.stdout.write(buf);
+            } catch (e) {
+                console.log(msg);
+            }
+        } else {
+            console.log(msg);
+        }
     }
 
 
@@ -378,25 +507,49 @@ export class RagTask {
 
 
     // 后台解析任务
-    public async parseTask(){
-        const sleep = 5 * 1000
-        let self = this;
+    public parseTask(){
+        logger.info('[RagTask] Starting parallel processing loops...');
+        this.runParseLoop();
+        this.runEmbedLoop();
+    }
 
-        setTimeout(async ()=>{
-            if(global.changePath){
-                global.changePath = false
-                indexService.copyDataPath()
+    private async runParseLoop() {
+        const sleep = 5000;
+        while(true) {
+            try {
+                if (!this.initialized) {
+                    await this.resetStuckTasks();
+                    this.initialized = true;
+                }
+                if((global as any).changePath) {
+                    logger.info('[RagTask] Detected changePath, copying data path...');
+                    (global as any).changePath = false
+                    indexService.copyDataPath()
+                }
+                await this.parse();
+            } catch (e) {
+                logger.error('[RagTask] Parse loop error:', e);
             }
-            // await LanceDBManager.optimizeAllTable()
-            await self.parse()
-            await self.embed()
-            self.parseTask()
-        },sleep)
+            await new Promise(r => setTimeout(r, sleep));
+        }
+    }
+
+    private async runEmbedLoop() {
+        const sleep = 5000;
+        while(true) {
+            try {
+                await this.embed();
+            } catch (e) {
+                logger.error('[RagTask] Embed loop error:', e);
+            }
+            await new Promise(r => setTimeout(r, sleep));
+        }
     }
 
 
     // 当向量数据足够多时，切换到余弦相似度索引
     public async switchToCosineIndex(){
+        this.logToTerminal('[RagTask] switchToCosineIndex called.');
         let tableList = pub.readdir(pub.get_data_path() + "/rag/vector_db")
         let indexTipsPath = pub.get_data_path() + "/rag/index_tips"
         if (!pub.file_exists(indexTipsPath)) {
@@ -404,6 +557,8 @@ export class RagTask {
         }
         
         for(let tablePath of tableList){
+            // 给主线程喘息机会
+            await new Promise(resolve => setTimeout(resolve, 100));
             let tableName = tablePath.split('/').pop()?.replace(".lance","")
             // console.log(tableName,tableName?.length)
             if (tableName?.length !== 32) {
@@ -431,36 +586,253 @@ export class RagTask {
      */
     public async parse(){
         let notParseDocument = await this.getNotParseDocument()
+        
+        if(!notParseDocument || notParseDocument.length === 0) {
+            return;
+        }
+        
+        this.logToTerminal('[RagTask] parse() started.');
+        this.logToTerminal(`[RagTask] Found ${notParseDocument.length} unparsed documents.`);
+        
+        // 限制每批处理的数量，防止一次处理太多导致卡顿太久
+        // 如果队列中有大量积压，分批处理可以让系统有喘息机会，并且防止长时间占用
+        if(notParseDocument && notParseDocument.length > 10){
+            notParseDocument = notParseDocument.slice(0, 10);
+        }
+
         let dataDir = pub.get_data_path()
         let repDataDir = '{DATA_DIR}'
 
         let ragObj = new Rag()
-        for(let doc of notParseDocument){
-            try{
-                let filename = doc.doc_file.replace(repDataDir, dataDir)
-                let parseDoc = await ragObj.parseDocument(filename,doc.doc_rag,true)
-                if(!parseDoc.content){
-                    // 标记为解析失败
-                    await LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${doc.doc_id}'`,values: {is_parsed: -1}})
-                    continue
+        const concurrency = 6
+        for (let i = 0; i < notParseDocument.length; i += concurrency) {
+                // 给主线程喘息机会
+                await new Promise(resolve => setTimeout(resolve, 200));
+                const batch = notParseDocument.slice(i, i + concurrency)
+            await Promise.all(batch.map(async (doc:any) => {
+                try{
+                    let filename = doc.doc_file.replace(repDataDir, dataDir)
+                    
+                    // 标记为处理中
+                    const baseName = path.basename(filename);
+                    const displayName = doc.doc_name || baseName;
+                    this.logToTerminal(`[RagTask] Marking file as processing: ${displayName} (${doc.doc_id})`);
+                    logger.info(`[RagTask] Marking file as processing: ${displayName} (${doc.doc_id})`);
+                    try {
+                        await Promise.race([
+                            LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${doc.doc_id}'`,values: {is_parsed: 1}}, displayName),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('Update status timeout')), 60000))
+                        ]);
+                    } catch (err) {
+                        this.logToTerminal(`[RagTask] Failed to mark processing status for ${doc.doc_id}, skipping.`);
+                        logger.error(`[RagTask] Failed to mark processing status for ${doc.doc_id}, skipping.`, err);
+                        return;
+                    }
+
+                    this.logToTerminal(`[RagTask] Start parsing file: ${displayName} (ID: ${doc.doc_id})`);
+                    logger.info(`[RagTask] Start parsing file: ${displayName} (ID: ${doc.doc_id})`);
+                    
+                    let timeoutMs = 300 * 1000 // Default 5 minutes
+                    try {
+                        const stats = fs.statSync(filename);
+                        const fileSizeMB = stats.size / (1024 * 1024);
+                        if (fileSizeMB > 50) {
+                            this.logToTerminal(`[RagTask] WARNING: File ${displayName} is large (${fileSizeMB.toFixed(2)} MB). Increasing timeout.`);
+                            logger.warn(`[RagTask] File ${displayName} is large (${fileSizeMB.toFixed(2)} MB).`);
+                            timeoutMs = 1800 * 1000; // 30 minutes for large files
+                        }
+                    } catch (e) {
+                        // Ignore file access errors here, parseDocument will handle it
+                    }
+
+                    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error(`Parse timeout after ${timeoutMs}ms`)), timeoutMs))
+                    
+                    // 构建唯一的中文文件名: 原文件名_ID.扩展名.md
+                    // 例如: 需求文档_2ee51cfc....docx.md
+                    let fileExt = path.extname(doc.doc_name);
+                    let fileNameNoExt = path.basename(doc.doc_name, fileExt);
+                    let customOutputName = `${fileNameNoExt}_${doc.doc_id}${fileExt}.md`;
+
+                    // Progress logging
+                    const progressInterval = setInterval(() => {
+                         this.logToTerminal(`[RagTask] Still parsing ${displayName} (${doc.doc_id})...`);
+                    }, 30000);
+
+                    let parseDoc:any;
+                    try {
+                        parseDoc = await Promise.race([
+                            ragObj.parseDocument(filename,doc.doc_rag,true,customOutputName),
+                            timeout
+                        ]);
+                    } finally {
+                        clearInterval(progressInterval);
+                    }
+                    this.logToTerminal(`[RagTask] Finished parsing file: ${displayName}`);
+                    logger.info(`[RagTask] Finished parsing file: ${displayName}`);
+                    
+                    if (parseDoc) {
+                        this.logToTerminal(`[RagTask] Parse result for ${displayName}: Success=${parseDoc.content ? 'Yes' : 'No'}, ContentLength=${parseDoc.content ? parseDoc.content.length : 0}, SavedPath=${parseDoc.savedPath || 'None'}`);
+                    } else {
+                        this.logToTerminal(`[RagTask] Parse result for ${displayName}: NULL`);
+                    }
+
+                    if(!parseDoc.content){
+                        this.logToTerminal(`[RagTask] No content parsed for ${displayName} (${doc.doc_id})`);
+                        logger.warn(`[RagTask] No content parsed for ${displayName} (${doc.doc_id})`);
+                        await LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${doc.doc_id}'`,values: {is_parsed: -1}}, displayName)
+                        return
+                    }
+                    if (parseDoc.savedPath) {
+                        this.logToTerminal(`[RagTask] 解析产出 MD 文件: ${parseDoc.savedPath}`);
+                        logger.info(`[RagTask] 解析产出 MD 文件: ${parseDoc.savedPath}`)
+                    }
+                    const postProcessPromise = (async () => {
+                        this.logToTerminal(`[RagTask] Start generating abstract for ${displayName}`);
+                        logger.info(`[RagTask] Start generating abstract for ${displayName}`)
+                        const abstract = await Promise.race([
+                            ragObj.generateAbstract(parseDoc.content),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('Generate abstract timeout')), 120000))
+                        ]);
+                        this.logToTerminal(`[RagTask] Skip full-doc keywords for ${displayName}`);
+                        logger.info(`[RagTask] Skip full-doc keywords for ${displayName}`)
+                        const keywords: string[] = []
+                        const pdata = {
+                            md_file: parseDoc.savedPath?.replace(dataDir, repDataDir),
+                            doc_abstract: abstract,
+                            is_parsed: 2,
+                            update_time: pub.time(),
+                        }
+                        this.logToTerminal(`[RagTask] Start updating record for ${displayName}`);
+                        logger.info(`[RagTask] Start updating record for ${displayName}`)
+                        await Promise.race([
+                            LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: pdata }, displayName),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('Update success status timeout')), 60000))
+                        ]);
+                        this.logToTerminal(`[RagTask] Successfully updated record for ${displayName}`);
+                        logger.info(`[RagTask] Successfully updated record for ${displayName}`)
+                        return true
+                    })()
+                    await Promise.race([
+                        postProcessPromise,
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('Post-processing timeout')), 180000))
+                    ])
+                }catch(e){
+                    this.logToTerminal(`[RagTask] [parseDocument]解析文档失败: ${e}`);
+                    logger.error(pub.lang('[parseDocument]解析文档失败'),e)
+                    try {
+                        await Promise.race([
+                            LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${doc.doc_id}'`,values: {is_parsed: -1}}, doc.doc_name || path.basename(filename)),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('Update failed status timeout')), 60000))
+                        ]);
+                    } catch (updateErr) {
+                        logger.error(`[RagTask] Failed to mark failed status for ${doc.doc_id}`, updateErr);
+                    }
                 }
-                let pdata = {
-                    md_file: parseDoc.savedPath?.replace(dataDir, repDataDir),
-                    doc_abstract: await ragObj.generateAbstract(parseDoc.content),
-                    doc_keywords: await ragObj.generateKeywords(parseDoc.content,5),
-                    is_parsed: 2,
-                    update_time: pub.time(),
-                }
-                // 更新文档状态
-                await LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${doc.doc_id}'`,values: pdata})
-            }catch(e){
-                logger.error(pub.lang('[parseDocument]解析文档失败'),e)
-                await LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${doc.doc_id}'`,values: {is_parsed: -1}})
-            }
+            }))
         }
     }
 
 
+
+    private async processDocument(doc: any, dataDir: string, repDataDir: string, ragObj: any, ragNameList: string[]) {
+        let md_file = doc.md_file.replace(repDataDir, dataDir)
+        let fileName = doc.doc_name || path.basename(md_file)
+        try {
+            logger.info(`[RagTask] [${fileName}] 1. Start processing (${doc.doc_id})`);
+
+            if (!pub.file_exists(md_file)) {
+                logger.warn(`[RagTask] MD file not found for ${fileName} (${doc.doc_id}): ${md_file}`);
+                await Promise.race([
+                    LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } }, fileName),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Update not found status timeout')), 60000))
+                ]);
+                return
+            }
+
+            this.logToTerminal(`[RagTask] [${fileName}] 2. Reading file...`);
+            let md_body = pub.read_file(md_file)
+            const chunkSize = doc.chunk_size || 1000
+            const overlap = 100
+
+            this.logToTerminal(`[RagTask] [${fileName}] 3. Splitting text...`);
+            let chunks = this.splitText(doc.doc_file, md_body, doc.separators, chunkSize, overlap)
+            this.logToTerminal(`[RagTask] [${fileName}] Split into ${chunks.length} chunks.`);
+
+            let chunkList: any[] = []
+            // 根据切片数量动态调整日志频率，避免刷屏
+            const logInterval = chunks.length > 1000 ? 100 : (chunks.length > 100 ? 20 : 5);
+            
+            for (let j = 0; j < chunks.length; j++) {
+                let chunk = chunks[j];
+                // 给主线程喘息机会，防止大量关键词生成卡死
+                await new Promise(resolve => setTimeout(resolve, 20));
+
+                if (j % logInterval === 0 || j === chunks.length - 1) {
+                    this.logToTerminal(`[RagTask] [${fileName}] 4. Generating keywords: ${j + 1}/${chunks.length}`);
+                }
+
+                let chunkInfo = {
+                    text: chunk,
+                    docId: doc.doc_id,
+                    tokens: pub.cutForSearch(chunk).join(' '),
+                    keywords: await Promise.race([
+                        ragObj.generateKeywords(chunk, 3),
+                        new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 30000))
+                    ])
+                }
+                chunkList.push(chunkInfo)
+            }
+
+            this.logToTerminal(`[RagTask] [${fileName}] 5. Adding to LanceDB (chunks: ${chunkList.length})...`);
+            let table = pub.md5(doc.doc_rag)
+            let ragInfo: any = await Promise.race([
+                ragObj.getRagInfo(doc.doc_rag),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Get RagInfo timeout')), 10000))
+            ]);
+            try {
+                const texts = chunkList.map(i => i.text)
+                const keywordsArr = chunkList.map(i => i.keywords)
+                this.logToTerminal(`[RagTask] [${fileName}] Invoking LanceDBManager.addDocuments...`);
+                await Promise.race([
+                    LanceDBManager.addDocuments(table, ragInfo.supplierName, ragInfo.embeddingModel, texts, keywordsArr, doc.doc_id),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Add documents timeout')), 300000))
+                ])
+                this.logToTerminal(`[RagTask] [${fileName}] LanceDBManager.addDocuments completed.`);
+            } catch (e: any) {
+                logger.error(pub.lang('[addDocuments]批量插入数据失败'), e)
+                const msg = String(e?.message || e)
+                if (msg.includes('Commit conflict') || msg.includes('concurrent commit')) {
+                    return
+                }
+                throw e
+            }
+
+            // 更新文档状态
+            this.logToTerminal(`[RagTask] [${fileName}] 6. Updating status...`);
+            await Promise.race([
+                LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: 3 } }, fileName),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Update success status timeout')), 60000))
+            ])
+
+            // 添加知识库名称到列表
+            if (!ragNameList.includes(doc.doc_rag)) {
+                ragNameList.push(doc.doc_rag)
+            }
+
+            this.logToTerminal(`[RagTask] [${fileName}] Done.`);
+            logger.info(`[RagTask] [${fileName}] (${doc.doc_id}) Done.`);
+        } catch (error) {
+            logger.error(`[RagTask] Error processing document ${fileName} (${doc.doc_id})`, error);
+            try {
+                await Promise.race([
+                    LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } }, fileName),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Update failed status timeout')), 60000))
+                ])
+            } catch (updateErr) {
+                logger.error(`[RagTask] Failed to update status to -1 for ${doc.doc_id}`, updateErr);
+            }
+        }
+    }
 
     /**
      * 开始嵌入文档
@@ -468,58 +840,101 @@ export class RagTask {
      */
     public async embed(){
         try{
+            // Debug log
+            logger.info('[RagTask] Checking for embedding tasks...');
             let notEmbeddingDocument = await this.getNotEmbeddingDocument()
+            if (notEmbeddingDocument && notEmbeddingDocument.length > 0) {
+                 logger.info(`[RagTask] Found ${notEmbeddingDocument.length} tasks in getNotEmbeddingDocument`);
+                 // Prioritize PDF tasks to unblock them from large XLSX tasks
+                 notEmbeddingDocument.sort((a: any, b: any) => {
+                    if (a.doc_rag === 'PDF' && b.doc_rag !== 'PDF') return -1;
+                    if (a.doc_rag !== 'PDF' && b.doc_rag === 'PDF') return 1;
+                    return 0;
+                 });
+            }
+            
+            if(!notEmbeddingDocument || notEmbeddingDocument.length === 0) {
+                return;
+            }
+
+            this.logToTerminal('[RagTask] embed() started.');
+            
+            this.logToTerminal(`[RagTask] Found ${notEmbeddingDocument.length} unembedded documents.`);
+            
+            // 限制每批处理的数量，防止一次处理太多导致内存溢出，但比之前大
+            if(notEmbeddingDocument && notEmbeddingDocument.length > 50){
+                notEmbeddingDocument = notEmbeddingDocument.slice(0, 50);
+            }
+
             let dataDir = pub.get_data_path()
             let repDataDir = '{DATA_DIR}'
             let ragObj = new Rag()
             let ragNameList:string[] = []
-            for(let doc of notEmbeddingDocument){
-                let md_file =  doc.md_file.replace(repDataDir, dataDir)
-                if(!pub.file_exists(md_file)){
-                    continue
-                }
-                let md_body = pub.read_file(md_file)
-                let chunks =  this.splitText(doc.doc_file,md_body,doc.separators,doc.chunk_size,doc.overlap_size)
-                let chunkList:any[] = []
-                for(let chunk of chunks){
-                    let chunkInfo = {
-                        text: chunk,
-                        docId: doc.doc_id,
-                        tokens: pub.cutForSearch(chunk).join(' '),
-                        keywords: await ragObj.generateKeywords(chunk,5)
+            // Reduce concurrency to 1 for debugging PDF embedding issues
+            const embedConcurrency = 1
+            
+            const executing: Promise<void>[] = [];
+            
+            for (const doc of notEmbeddingDocument) {
+                // 给主线程喘息机会
+                await new Promise(resolve => setTimeout(resolve, 20));
+                
+                // 创建任务 Promise
+                const p = this.processDocument(doc, dataDir, repDataDir, ragObj, ragNameList).then(() => {
+                    // 任务完成后从 executing 数组移除
+                    const index = executing.indexOf(p);
+                    if (index > -1) {
+                        executing.splice(index, 1);
                     }
-                    chunkList.push(chunkInfo)
-                }
-
-                let table = pub.md5(doc.doc_rag)
-                let ragInfo:any = await ragObj.getRagInfo(doc.doc_rag)
-                for (let checkInfo of chunkList){
-                    try{
-                        await LanceDBManager.addDocument(table,ragInfo.supplierName,ragInfo.embeddingModel,checkInfo.text,checkInfo.keywords,checkInfo.docId,checkInfo.tokens)
-                    }catch(e){
-                        logger.error(pub.lang('[addDocument]插入数据失败'),e)
-                        await LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${doc.doc_id}'`,values: {is_parsed: -1}})
-                    }
-                }
-
-                // 更新文档状态
-                await LanceDBManager.updateRecord(this.docTable,{where: `doc_id='${doc.doc_id}'`,values: {is_parsed: 3}})
-
-                // 添加知识库名称到列表
-                if(!ragNameList.includes(doc.doc_rag)){
-                    ragNameList.push(doc.doc_rag)
+                });
+                
+                executing.push(p);
+                
+                // 如果达到并发上限，等待任意一个完成
+                if (executing.length >= embedConcurrency) {
+                    await Promise.race(executing);
                 }
             }
             
+            // 等待所有剩余任务完成
+            await Promise.all(executing);
+            
             // 更新知识库FIT索引
-            for(let ragName of ragNameList){
-                let encryptTableName = pub.md5(ragName)
-                await LanceDBManager.createDocFtsIndex(encryptTableName)
-                await LanceDBManager.optimizeTable(encryptTableName)
+            if (ragNameList.length > 0) {
+                this.logToTerminal('[RagTask] Starting FTS index update for: ' + ragNameList.join(', '));
+                logger.info('[RagTask] Starting FTS index update for: ' + ragNameList.join(', '));
+                for(let ragName of ragNameList){
+                    try {
+                        // 给主线程喘息机会
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                        let encryptTableName = pub.md5(ragName)
+                        this.logToTerminal(`[RagTask] Creating index for ${ragName}...`);
+                        logger.info(`[RagTask] Creating index for ${ragName}...`);
+                        await Promise.race([
+                            LanceDBManager.createDocFtsIndex(encryptTableName),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('Create FTS Index timeout')), 300000))
+                        ]);
+                        
+                        this.logToTerminal(`[RagTask] Optimizing table ${ragName}...`);
+                        logger.info(`[RagTask] Optimizing table ${ragName}...`);
+                        await Promise.race([
+                            LanceDBManager.optimizeTable(encryptTableName),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('Optimize Table timeout')), 300000))
+                        ]);
+                        this.logToTerminal(`[RagTask] Finished index update for ${ragName}`);
+                        logger.info(`[RagTask] Finished index update for ${ragName}`);
+                    } catch (err) {
+                        this.logToTerminal(`[RagTask] Failed to update index for ${ragName}: ${err}`);
+                        logger.error(`[RagTask] Failed to update index for ${ragName}`, err);
+                    }
+                }
+                this.logToTerminal('[RagTask] All index updates completed.');
+                logger.info('[RagTask] All index updates completed.');
             }
             
 
         }catch(e){
+            this.logToTerminal(`[RagTask] [embed]嵌入文档失败: ${e}`);
             logger.error(pub.lang('[embed]嵌入文档失败'),e)
             return e
         }

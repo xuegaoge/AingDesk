@@ -13,7 +13,7 @@ import { getSiderStoreData } from "../store"
 import { getHeaderStoreData } from "@/views/Header/store"
 import { getThirdPartyApiStoreData } from "@/views/ThirdPartyApi/store"
 import { getSoftSettingsStoreData } from "@/views/SoftSettings/store"
-import { getChatToolsStoreData } from "@/views/ChatTools/store"
+import { getChatToolsStoreData, useChatToolsStore } from "@/views/ChatTools/store"
 import { getKnowledgeStoreData } from "@/views/KnowleadgeStore/store"
 import { getAgentStoreData } from "@/views/Agent/store"
 import { getChatContentStoreData } from "@/views/ChatContent/store"
@@ -121,6 +121,19 @@ export async function getChatInfo(context_id: string) {
         const res = await post("/chat/get_chat_info", { context_id })
         if (res.code == 200) {
             chatHistory.value = generateObject(res.message)
+            // 页面加载后复原 MCP 进度时间线（使用最后一条助手消息的 mcp_progress）
+            try {
+                const chatToolsStore = useChatToolsStore()
+                chatToolsStore.resetMcpProgress(context_id)
+                const raw = res.message
+                if (raw && Array.isArray(raw) && raw.length) {
+                    const lastAssistant = raw[raw.length - 1]
+                    const events = lastAssistant?.mcp_progress
+                    if (events && Array.isArray(events) && events.length) {
+                        chatToolsStore.hydrateMcpProgress(context_id, events)
+                    }
+                }
+            } catch (_) {}
         }
         // 渲染对话历史后立即滑动到底部
         nextTick(() => eventBUS.$emit("doScroll"))
@@ -155,6 +168,7 @@ function generateObject(arr: any) {
             stat: arr[i + 1].stat,
             search_result: arr[i + 1].search_result,
             tools_result: arr[i + 1].tools_result,
+            mcp_progress: arr[i + 1].mcp_progress,
             id: arr[i + 1].id
         });
 

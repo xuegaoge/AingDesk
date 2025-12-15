@@ -142,6 +142,8 @@ export class DocumentParser {
      * @returns 解析结果
      */
     public static async parseDocument(filename: string, ragName: string): Promise<ParseResult> {
+        // 给主线程喘息机会
+        await new Promise(resolve => setTimeout(resolve, 100));
         try {
             // 获取文件扩展名
             const extension = this.getFileExtension(filename);
@@ -198,12 +200,14 @@ export class DocumentParser {
      * @param filename 原始文件路径
      * @param content 解析内容
      * @param ragName 知识库名称
+     * @param customOutputFilename 自定义输出文件名（不含扩展名）
      * @returns 保存的文件路径
      */
     public static async saveToFile(
         filename: string,
         content: string,
-        ragName: string
+        ragName: string,
+        customOutputFilename?: string
     ): Promise<{ parsedPath: string }> {
         try {
             // 确保输出目录存在
@@ -213,8 +217,16 @@ export class DocumentParser {
             }
 
             // 为解析结果生成保存路径
-            const basename = path.basename(filename);
-            const outputFilename = `${basename}.md`;
+            let outputFilename: string;
+            if (customOutputFilename) {
+                // 如果提供了自定义文件名，直接使用（确保有.md后缀）
+                outputFilename = customOutputFilename.endsWith('.md') ? customOutputFilename : `${customOutputFilename}.md`;
+            } else {
+                // 否则使用原文件名
+                const basename = path.basename(filename);
+                outputFilename = `${basename}.md`;
+            }
+            
             const outputPath = path.join(outputDir, outputFilename);
 
             // 保存解析内容
@@ -236,12 +248,14 @@ export class DocumentParser {
  * @param filename 文件路径
  * @param ragName 知识库名称
  * @param saveToFile 是否保存到文件
+ * @param customOutputFilename 自定义输出文件名
  * @returns 解析结果和保存路径
  */
 export async function parseDocument(
     filename: string,
     ragName: string = '',
-    saveToFile: boolean = false
+    saveToFile: boolean = false,
+    customOutputFilename?: string
 ): Promise<{ content: string; savedPath?: string }> {
     try {
         // 解析文档
@@ -250,7 +264,7 @@ export async function parseDocument(
         // 如果指定了要保存到文件
         let savedPath: string | undefined;
         if (saveToFile && result.success && ragName) {
-            const saveResult = await DocumentParser.saveToFile(filename, result.content, ragName);
+            const saveResult = await DocumentParser.saveToFile(filename, result.content, ragName, customOutputFilename);
             savedPath = saveResult.parsedPath;
         }
 

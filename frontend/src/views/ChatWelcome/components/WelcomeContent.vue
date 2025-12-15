@@ -4,7 +4,7 @@
             <n-image :src="AingDesk" width="30" height="30" preview-disabled />
         </div>
         <div class="answer-token">
-            <p>{{ $t("欢迎使用AingDesk，这是一款简单好用的AI助手，支持知识库、模型API、分享、联网搜索、智能体，此软件开源免费，也期待您分享软件给别人来支持我们的发展。") }}</p>
+            <p>{{ $t("欢迎使用亿级卖家智库系统V1.1，这是一款专为电商卖家打造的AI智能助手，支持商品分析、市场研究、竞品监控、销售策略制定，助力您的电商业务增长。") }}</p>
         </div>
     </div>
     <div class="answer" style="margin-bottom: 20px;">
@@ -12,7 +12,7 @@
             <n-image :src="AingDesk" width="30" height="30" preview-disabled />
         </div>
         <div class="answer-token">
-            <p>{{ $t("AingDesk是一个新的AI项目，它还在努力快速成长中，如果您在使用过程中遇到什么问题，或者您对软件有什么功能需求，可以加入我们微信群给我们进行反馈。") }}</p>
+            <p>{{ $t("亿级卖家智库系统V1.1是专为电商卖家设计的智能分析系统，持续优化产品功能，如果您在使用过程中遇到什么问题，或者您对软件有什么功能需求，可以加入我们微信群给我们进行反馈。") }}</p>
             <p class="flex flex-col justify-start items-start mt-20 w-200">
                 <n-image :src="wechat" width="100px" />
             </p>
@@ -53,7 +53,7 @@ import { useI18n } from "vue-i18n";
 const { t: $t } = useI18n()
 
 function jumpToGithub() {
-    window.open("https://github.com/aingdesk/AingDesk")
+    window.open("https://github.com/aingdesk/亿级卖家智库系统V1.1")
 }
 </script>
 

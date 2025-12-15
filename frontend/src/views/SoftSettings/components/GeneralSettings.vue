@@ -73,7 +73,7 @@
             </n-list-item>
             <n-list-item>
                 <div class="flex justify-center flex-col items-center gap-2.5">
-                    <span>{{ $t("加入AingDesk交流群") }}</span>
+                    <span>{{ $t("加入亿级卖家智库系统交流群") }}</span>
                     <n-image :src="wechat" width="100px" />
                 </div>
             </n-list-item>

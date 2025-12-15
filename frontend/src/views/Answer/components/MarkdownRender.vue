@@ -25,7 +25,9 @@
     <!-- <McpToolsWrapper
         :content="content.match(/<mcptool>([\s\S]*?)(?:<\/mcptool>|$)/) ? content.match(/<mcptool>([\s\S]*?)(?:<\/mcptool>|$)/)![1] : ''"
         v-if="content.match(/<mcptool>([\s\S]*?)(?:<\/mcptool>|$)/)" /> -->
-    <!-- 回答过程中的渲染 -->
+    <!-- MCP 进度时间线 -->
+    <McpProgressTimeline />
+    <!-- 回答过程中的渲染（仅保留 type==='result' 的 mcptool 片段） -->
     <McpToolsWrapper v-for="(item, index) in tools_content_arr" :key="index" :content="item" />
     <!-- 获取信息后的渲染 -->
     <McpToolsWrapper :content="item" v-if="tools_result && tools_result.length" v-for="(item, index) in tools_result"
@@ -40,6 +42,7 @@ import markdownit from 'markdown-it'
 import hljs from 'highlight.js';
 import ThinkWrapper from "./ThinkWrapper.vue";
 import McpToolsWrapper from "./McpToolsWrapper.vue";
+import McpProgressTimeline from "./McpProgressTimeline.vue";
 import MermaidRender from './MermaidRender.vue';
 import { eventBUS } from '@/views/Home/utils/tools.tsx';
 import { useI18n } from 'vue-i18n';
@@ -59,8 +62,22 @@ const { t: $t } = useI18n()
 const { themeColors, themeMode, currentLanguage } = getSoftSettingsStoreData()
 const { questionContent } = getChatToolsStoreData()
 const tools_content_arr = computed(() => {
-    const matches = props.content.match(/<mcptool>([\s\S]*?)<\/mcptool>/g);
-    return matches ? matches.map(match => match.replace(/<mcptool>|<\/mcptool>/g, "").trim()) : [];
+    const matches = props.content.match(/<mcptool>([\s\S]*?)<\/mcptool>/g) || []
+    const items = matches.map(match => match.replace(/<mcptool>|<\/mcptool>/g, "").trim())
+    // 过滤仅展示结果类事件
+    const filtered = [] as string[]
+    for (const it of items) {
+        try {
+            const obj = JSON.parse(it)
+            if (obj && obj.type === 'result') {
+                filtered.push(it)
+            }
+        } catch {
+            // 如果解析失败，保守展示（避免误过滤实际结果）
+            filtered.push(it)
+        }
+    }
+    return filtered
 })
 
 const props = defineProps<{ content: string, searchResult?: Array<{ content: string, link: string, title: string }>, tools_result?: Array<string> }>()

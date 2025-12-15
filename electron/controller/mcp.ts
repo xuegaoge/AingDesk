@@ -31,6 +31,57 @@ class McpController {
     }
 
     /**
+     * 执行指定 MCP 服务器的工具（一次性调用）
+     * @param args.name <string> - MCP服务器名称
+     * @param args.tool_name <string> - 工具名称
+     * @param args.tool_args <any> - 工具参数（object 或 JSON 字符串）
+     * @param args.compat_mode <'strict'|'lenient'> - 兼容模式，默认 strict
+     */
+    async execute_mcp_tool(args: { name: string, tool_name: string, tool_args: any, compat_mode?: 'strict' | 'lenient' }) {
+        try {
+            if (!args || !args.name || !args.tool_name) {
+                return pub.return_error(pub.lang('参数错误'));
+            }
+
+            // 解析 tool_args
+            let toolArgs: any = args.tool_args;
+            if (typeof toolArgs === 'string') {
+                try {
+                    toolArgs = JSON.parse(toolArgs);
+                } catch (e) {
+                    // 保持原样传递字符串参数
+                }
+            }
+
+            let mcpServers: ServerConfig[] = mcpService.get_mcp_servers();
+            let server = mcpServers.find((s: ServerConfig) => s.name === args.name);
+            if (!server) {
+                return pub.return_error(pub.lang('未找到该服务器'));
+            }
+
+            const mcpClient = new MCPClient();
+            const compatMode = args.compat_mode === 'lenient' ? 'lenient' : 'strict';
+            const { push, text, raw } = await mcpClient.runToolOnce(server, args.tool_name, toolArgs, { compatMode });
+
+            // 附加落盘调试日志到 Claude Code 调试目录
+            try {
+                const debugDir = path.resolve(process.env['USERPROFILE'] || process.env['HOMEPATH'] || 'C:/Users/Administrator', '.claude', 'debug');
+                pub.mkdir(debugDir);
+                const ts = new Date().toISOString().replace(/[:.]/g, '-');
+                const logFile = path.resolve(debugDir, `aingdesk-mcp-${server.name}-${args.tool_name}-${ts}.json`);
+                pub.write_file(logFile, JSON.stringify({ server: server.name, tool: args.tool_name, args: toolArgs, push, text, raw }, null, 2));
+            } catch (e) {
+                logger.warn('写入 Claude 调试日志失败：', e);
+            }
+
+            return pub.return_success(pub.lang('执行成功'), { server: server.name, tool: args.tool_name, args: toolArgs, push, text, raw });
+        } catch (e) {
+            logger.error('execute_mcp_tool 失败：', e);
+            return pub.return_error(pub.lang('执行失败'), e?.message || e);
+        }
+    }
+
+    /**
      * 获取常用的MCP服务器列表
      * @param args 
      * @returns {Promise<any>} - 返回常用的MCP服务器列表

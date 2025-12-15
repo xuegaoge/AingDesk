@@ -5,7 +5,7 @@
             <div class="welcome-content">
                 <div class="logo-wrapper">
                     <NImage :src="logo" class="logo" width="100px" />
-                    <span class="brand">AingDesk</span>
+                    <span class="brand">亿级卖家智库系统V1.1</span>
                     <span class="slogan">{{ $t("简单好用的AI助手") }}</span>
                 </div>
                 <div class="desc-wrapper">
