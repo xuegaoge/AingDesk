@@ -16,3 +16,4 @@ Use `@/openspec/AGENTS.md` to learn:
 Keep this managed block so 'openspec update' can refresh the instructions.
 
 <!-- OPENSPEC:END -->
+- 全局语言：所有思考过程与输出优先中文显示。

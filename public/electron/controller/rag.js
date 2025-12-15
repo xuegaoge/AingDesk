@@ -151,8 +151,21 @@ class RagController {
     if (!import_public.pub.file_exists(ragPath)) {
       return import_public.pub.return_error(import_public.pub.lang("\u77E5\u8BC6\u5E93\u4E0D\u5B58\u5728"));
     }
+    try {
+      await import_vector_lancedb.LanceDBManager.updateRecord(
+        "doc_table",
+        { where: `doc_rag='${args.ragName}' AND is_parsed != 3 AND is_parsed != -1`, values: { is_parsed: -1 } },
+        `\u505C\u6B62\u77E5\u8BC6\u5E93 ${args.ragName} \u7684\u89E3\u6790\u4EFB\u52A1`
+      );
+    } catch (e) {
+      console.error(`\u6807\u8BB0\u89E3\u6790\u4EFB\u52A1\u5931\u8D25: ${e.message}`);
+    }
     let ragObj = new import_rag.Rag();
-    ragObj.removeRag(args.ragName);
+    try {
+      await ragObj.removeRag(args.ragName);
+    } catch (e) {
+      console.error(`\u5220\u9664\u77E5\u8BC6\u5E93\u6570\u636E\u5E93\u8BB0\u5F55\u5931\u8D25: ${e.message}`);
+    }
     import_public.pub.rmdir(ragPath);
     const indexTipFile = path.join(import_public.pub.get_data_path(), "rag", "index_tips", import_public.pub.md5(args.ragName) + ".pl");
     if (import_public.pub.file_exists(indexTipFile)) {

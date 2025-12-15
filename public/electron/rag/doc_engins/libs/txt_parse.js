@@ -31,10 +31,43 @@ __export(txt_parse_exports, {
 });
 module.exports = __toCommonJS(txt_parse_exports);
 var fs = __toESM(require("fs"));
+function cleanContent(content) {
+  let cleaned = content;
+  cleaned = cleaned.replace(/!\[([^\]]*)\]\(https?:\/\/[^\)]+\)/g, (match, alt) => {
+    return alt ? `[\u56FE\u7247:${alt}]` : "[\u56FE\u7247]";
+  });
+  const adPatterns = [
+    /广告投放\s*[:：]?\s*请加\s*QQ\s*[:：]?\s*\d+/gi,
+    /长按下方图片.*?订阅微信公众号/gi,
+    /识别二维码.*?订阅/gi,
+    /扫码关注.*?公众号/gi,
+    /点击.*?关注我们/gi,
+    /更多内容请访问\s*www\.[^\s]+/gi
+  ];
+  for (const pattern of adPatterns) {
+    cleaned = cleaned.replace(pattern, "");
+  }
+  cleaned = cleaned.replace(/Copyright\s*©?\s*[\w\s®]+\s*\d{4}(-\d{4})?/gi, "");
+  cleaned = cleaned.replace(/\*{3,}/g, "");
+  cleaned = cleaned.replace(/_{3,}/g, "");
+  cleaned = cleaned.replace(/={3,}/g, "---");
+  cleaned = cleaned.replace(/预览时标签不可点/g, "");
+  cleaned = cleaned.replace(/阅读\s*微信扫一扫/g, "");
+  cleaned = cleaned.replace(/在小说阅读器中沉浸阅读/g, "");
+  cleaned = cleaned.replace(/\[([^\]]+)\]\(javascript:void\\?\(0\\?\);?\)/g, "$1");
+  cleaned = cleaned.replace(/\n{4,}/g, "\n\n\n");
+  cleaned = cleaned.split("\n").map((line) => line.trim()).join("\n");
+  cleaned = cleaned.replace(/\[\s*\]\([^\)]*\)/g, "");
+  return cleaned.trim();
+}
 async function parse(filename, ragName) {
   try {
     let body = fs.readFileSync(filename);
-    return body.toString();
+    let content = body.toString();
+    if (filename.endsWith(".md") || filename.endsWith(".markdown")) {
+      content = cleanContent(content);
+    }
+    return content;
   } catch (error) {
     console.error("\u89E3\u6790Markdown\u5931\u8D25:", error);
     return "";

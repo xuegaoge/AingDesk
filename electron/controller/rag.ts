@@ -168,9 +168,26 @@ class RagController {
             return pub.return_error(pub.lang('知识库不存在'));
         }
 
-        // 删除知识库所有文档和向量索引
+        // 第一步：将该知识库正在进行的解析任务标记为失败，防止后台任务继续处理
+        try {
+            // is_parsed: 0=待处理, 1=处理中, 2=待嵌入 -> 全部标记为 -1(失败)
+            await LanceDBManager.updateRecord(
+                'doc_table',
+                { where: `doc_rag='${args.ragName}' AND is_parsed != 3 AND is_parsed != -1`, values: { is_parsed: -1 } },
+                `停止知识库 ${args.ragName} 的解析任务`
+            );
+        } catch (e: any) {
+            console.error(`标记解析任务失败: ${e.message}`);
+        }
+
+        // 第二步：删除知识库所有文档和向量索引（必须等待完成后再删除文件夹）
         let ragObj = new Rag();
-        ragObj.removeRag(args.ragName);
+        try {
+            await ragObj.removeRag(args.ragName);
+        } catch (e: any) {
+            // 即使数据库删除失败，也继续删除文件夹（避免残留）
+            console.error(`删除知识库数据库记录失败: ${e.message}`);
+        }
 
         // 删除知识库文件
         pub.rmdir(ragPath);

@@ -786,8 +786,28 @@ export class LanceDBManager {
 
             // 添加记录
             await tableObj.add(record);
-            // await tableObj.optimize();
-            // logger.info(`成功添加文档到表 ${tableName}`);
+            
+            // 节流优化：降低频率，每100次或5分钟执行一次optimize
+            // optimize只影响存储大小，不影响数据质量，可以在解析完成后统一执行
+            const g: any = global as any;
+            if (!g.addRecordOptimize) {
+                g.addRecordOptimize = { count: 0, last: Date.now() };
+            }
+            g.addRecordOptimize.count++;
+            const now = Date.now();
+            const needOptimize = (g.addRecordOptimize.count % 100 === 0) || (now - g.addRecordOptimize.last > 300000);
+            if (needOptimize) {
+                try {
+                    await tableObj.optimize({
+                        deleteUnverified: true,
+                        cleanupOlderThan: new Date()
+                    });
+                    g.addRecordOptimize.last = now;
+                } catch (optimizeErr: any) {
+                    logger.warn(`[LanceDB] addRecord optimize失败 (非致命): ${optimizeErr.message}`);
+                }
+            }
+            
             return true;
         } catch (error: any) {
             throw new Error(`添加文档失败: ${error.message}`);
@@ -867,7 +887,17 @@ export class LanceDBManager {
                     g.docTableOptimize.last = now;
                 }
             }
-            if (needOptimize) {
+            // 降低optimize频率：每200次或5分钟执行一次
+            // optimize只影响存储大小，不影响数据质量
+            if (needOptimize && (g.docTableOptimize.count % 200 === 0 || now - last > 300000)) {
+                try {
+                    await tableObj.optimize({
+                        deleteUnverified: true,
+                        cleanupOlderThan: new Date()
+                    });
+                } catch (optimizeErr: any) {
+                    logger.warn(`[LanceDB] optimize失败 (非致命): ${optimizeErr.message}`);
+                }
             }
             const msg = logInfo ? `成功更新-${logInfo} 到表 ${tableName}` : `成功更新文档到表 ${tableName}`;
             logger.info(msg);
@@ -903,7 +933,10 @@ export class LanceDBManager {
 
             // 删除记录
             await tableObj.delete(where);
-            await tableObj.optimize();
+            // 大量删除时 optimize 可能很慢，改为异步执行不阻塞
+            tableObj.optimize().catch((e: any) => {
+                logger.warn(`优化表 ${tableName} 失败（非致命）: ${e.message}`);
+            });
             // logger.info(`成功删除文档到表 ${tableName}`);
             return true;
         } catch (error: any) {
@@ -1102,9 +1135,19 @@ export class LanceDBManager {
             const info = global.vectorOptimize[tableName] || { last: 0, count: 0 };
             const now = Date.now();
             info.count++;
-            const needOptimize = (info.count % 10 === 0) || (now - info.last > 30000);
+            // 降低optimize频率：每50次或5分钟执行一次
+            // optimize只影响存储大小，不影响数据质量
+            const needOptimize = (info.count % 50 === 0) || (now - info.last > 300000);
             if (needOptimize) {
-                info.last = now;
+                try {
+                    await tableObj.optimize({
+                        deleteUnverified: true,
+                        cleanupOlderThan: new Date()
+                    });
+                    info.last = now;
+                } catch (optimizeErr: any) {
+                    logger.warn(`[LanceDB] 批量添加optimize失败 (非致命): ${optimizeErr.message}`);
+                }
             }
             // @ts-ignore
             global.vectorOptimize[tableName] = info;
@@ -1829,12 +1872,15 @@ export class LanceDBManager {
             await db.dropTable(tableName);
             return true;
         } catch (error: any) {
-            if (error.message.includes('LanceError(IO)')) {
-                // 通过删除表文件来解决IO错误
-                const tablePath = path.join(pub.get_db_path(), `${tableName}.lance`);
-                if (fs.existsSync(tablePath)) {
-                    fs.rmdirSync(tablePath, { recursive: true });
+            // 通过删除表文件来解决各种错误（IO错误、超时等）
+            const tablePath = path.join(pub.get_db_path(), `${tableName}.lance`);
+            if (fs.existsSync(tablePath)) {
+                try {
+                    fs.rmSync(tablePath, { recursive: true, force: true });
+                    logger.info(`通过删除文件方式成功删除表 ${tableName}`);
                     return true;
+                } catch (rmError: any) {
+                    logger.error(`删除表文件失败: ${rmError.message}`);
                 }
             }
             throw new Error(`删除表失败: ${error.message}`);

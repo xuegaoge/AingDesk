@@ -149,8 +149,8 @@ time: ${endTime - startTime}s`);
     }
     let cache_path = this.getEmbeddingCachePath();
     let files = import_public.pub.readdir(cache_path);
-    let now = /* @__PURE__ */ new Date();
-    let nowTime = now.getTime();
+    let now2 = /* @__PURE__ */ new Date();
+    let nowTime = now2.getTime();
     let week = 1e3 * 60 * 60 * 24 * 7;
     for (let i = 0; i < files.length; i++) {
       let file = files[i];
@@ -175,8 +175,8 @@ time: ${endTime - startTime}s`);
     let cache_file = path.join(cache_path, `${key}.json`);
     if (fs.existsSync(cache_file)) {
       let cache = import_public.pub.read_json(cache_file);
-      let now = /* @__PURE__ */ new Date();
-      fs.utimesSync(cache_file, now, now);
+      let now2 = /* @__PURE__ */ new Date();
+      fs.utimesSync(cache_file, now2, now2);
       return cache;
     }
     return [];
@@ -620,6 +620,24 @@ time: ${endTime - startTime}s`);
       }
       let tableObj = await db.openTable(tableName);
       await tableObj.add(record);
+      const g2 = global;
+      if (!g2.addRecordOptimize) {
+        g2.addRecordOptimize = { count: 0, last: Date.now() };
+      }
+      g2.addRecordOptimize.count++;
+      const now2 = Date.now();
+      const needOptimize = g2.addRecordOptimize.count % 100 === 0 || now2 - g2.addRecordOptimize.last > 3e5;
+      if (needOptimize) {
+        try {
+          await tableObj.optimize({
+            deleteUnverified: true,
+            cleanupOlderThan: /* @__PURE__ */ new Date()
+          });
+          g2.addRecordOptimize.last = now2;
+        } catch (optimizeErr) {
+          import_log.logger.warn(`[LanceDB] addRecord optimize\u5931\u8D25 (\u975E\u81F4\u547D): ${optimizeErr.message}`);
+        }
+      }
       return true;
     } catch (error) {
       throw new Error(`\u6DFB\u52A0\u6587\u6863\u5931\u8D25: ${error.message}`);
@@ -642,14 +660,14 @@ time: ${endTime - startTime}s`);
    * await LanceDBManager.updateRecord('test', { where:'id=1',values:{name:'test1',age:20} });
    */
   static async updateRecord(tableName, record, logInfo) {
-    const g = global;
+    const g2 = global;
     if (tableName === "doc_table") {
-      if (!g.docUpdateQueue) {
-        g.docUpdateQueue = Promise.resolve();
+      if (!g2.docUpdateQueue) {
+        g2.docUpdateQueue = Promise.resolve();
       }
-      const prev = g.docUpdateQueue;
+      const prev = g2.docUpdateQueue;
       const next = prev.then(() => this.doUpdateRecord(tableName, record, logInfo));
-      g.docUpdateQueue = next.catch(() => {
+      g2.docUpdateQueue = next.catch(() => {
       });
       return await next;
     }
@@ -685,19 +703,27 @@ time: ${endTime - startTime}s`);
       }
       let needOptimize = true;
       if (tableName === "doc_table") {
-        const now = Date.now();
-        const g = global;
-        if (!g.docTableOptimize) {
-          g.docTableOptimize = { last: 0, count: 0 };
+        const now2 = Date.now();
+        const g2 = global;
+        if (!g2.docTableOptimize) {
+          g2.docTableOptimize = { last: 0, count: 0 };
         }
-        g.docTableOptimize.count++;
-        const last = g.docTableOptimize.last || 0;
-        needOptimize = g.docTableOptimize.count % 50 === 0 || now - last > 3e4;
+        g2.docTableOptimize.count++;
+        const last2 = g2.docTableOptimize.last || 0;
+        needOptimize = g2.docTableOptimize.count % 50 === 0 || now2 - last2 > 3e4;
         if (needOptimize) {
-          g.docTableOptimize.last = now;
+          g2.docTableOptimize.last = now2;
         }
       }
-      if (needOptimize) {
+      if (needOptimize && (g.docTableOptimize.count % 200 === 0 || now - last > 3e5)) {
+        try {
+          await tableObj.optimize({
+            deleteUnverified: true,
+            cleanupOlderThan: /* @__PURE__ */ new Date()
+          });
+        } catch (optimizeErr) {
+          import_log.logger.warn(`[LanceDB] optimize\u5931\u8D25 (\u975E\u81F4\u547D): ${optimizeErr.message}`);
+        }
       }
       const msg = logInfo ? `\u6210\u529F\u66F4\u65B0-${logInfo} \u5230\u8868 ${tableName}` : `\u6210\u529F\u66F4\u65B0\u6587\u6863\u5230\u8868 ${tableName}`;
       import_log.logger.info(msg);
@@ -726,7 +752,9 @@ time: ${endTime - startTime}s`);
       }
       let tableObj = await db.openTable(tableName);
       await tableObj.delete(where);
-      await tableObj.optimize();
+      tableObj.optimize().catch((e) => {
+        import_log.logger.warn(`\u4F18\u5316\u8868 ${tableName} \u5931\u8D25\uFF08\u975E\u81F4\u547D\uFF09: ${e.message}`);
+      });
       return true;
     } catch (error) {
       import_log.logger.error(`\u5220\u9664\u6587\u6863\u5931\u8D25: ${error.message}`);
@@ -884,11 +912,19 @@ time: ${endTime - startTime}s`);
         global.vectorOptimize = {};
       }
       const info = global.vectorOptimize[tableName] || { last: 0, count: 0 };
-      const now = Date.now();
+      const now2 = Date.now();
       info.count++;
-      const needOptimize = info.count % 10 === 0 || now - info.last > 3e4;
+      const needOptimize = info.count % 50 === 0 || now2 - info.last > 3e5;
       if (needOptimize) {
-        info.last = now;
+        try {
+          await tableObj.optimize({
+            deleteUnverified: true,
+            cleanupOlderThan: /* @__PURE__ */ new Date()
+          });
+          info.last = now2;
+        } catch (optimizeErr) {
+          import_log.logger.warn(`[LanceDB] \u6279\u91CF\u6DFB\u52A0optimize\u5931\u8D25 (\u975E\u81F4\u547D): ${optimizeErr.message}`);
+        }
       }
       global.vectorOptimize[tableName] = info;
       return records.length;
@@ -1331,11 +1367,14 @@ time: ${endTime - startTime}s`);
       await db.dropTable(tableName);
       return true;
     } catch (error) {
-      if (error.message.includes("LanceError(IO)")) {
-        const tablePath = path.join(import_public.pub.get_db_path(), `${tableName}.lance`);
-        if (fs.existsSync(tablePath)) {
-          fs.rmdirSync(tablePath, { recursive: true });
+      const tablePath = path.join(import_public.pub.get_db_path(), `${tableName}.lance`);
+      if (fs.existsSync(tablePath)) {
+        try {
+          fs.rmSync(tablePath, { recursive: true, force: true });
+          import_log.logger.info(`\u901A\u8FC7\u5220\u9664\u6587\u4EF6\u65B9\u5F0F\u6210\u529F\u5220\u9664\u8868 ${tableName}`);
           return true;
+        } catch (rmError) {
+          import_log.logger.error(`\u5220\u9664\u8868\u6587\u4EF6\u5931\u8D25: ${rmError.message}`);
         }
       }
       throw new Error(`\u5220\u9664\u8868\u5931\u8D25: ${error.message}`);
