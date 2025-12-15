@@ -49,6 +49,48 @@ class McpController {
     return import_public.pub.return_success(import_public.pub.lang("\u83B7\u53D6\u6210\u529F"), mcpServers);
   }
   /**
+   * 执行指定 MCP 服务器的工具（一次性调用）
+   * @param args.name <string> - MCP服务器名称
+   * @param args.tool_name <string> - 工具名称
+   * @param args.tool_args <any> - 工具参数（object 或 JSON 字符串）
+   * @param args.compat_mode <'strict'|'lenient'> - 兼容模式，默认 strict
+   */
+  async execute_mcp_tool(args) {
+    try {
+      if (!args || !args.name || !args.tool_name) {
+        return import_public.pub.return_error(import_public.pub.lang("\u53C2\u6570\u9519\u8BEF"));
+      }
+      let toolArgs = args.tool_args;
+      if (typeof toolArgs === "string") {
+        try {
+          toolArgs = JSON.parse(toolArgs);
+        } catch (e) {
+        }
+      }
+      let mcpServers = import_mcp.mcpService.get_mcp_servers();
+      let server = mcpServers.find((s) => s.name === args.name);
+      if (!server) {
+        return import_public.pub.return_error(import_public.pub.lang("\u672A\u627E\u5230\u8BE5\u670D\u52A1\u5668"));
+      }
+      const mcpClient = new import_mcp_client.MCPClient();
+      const compatMode = args.compat_mode === "lenient" ? "lenient" : "strict";
+      const { push, text, raw } = await mcpClient.runToolOnce(server, args.tool_name, toolArgs, { compatMode });
+      try {
+        const debugDir = path.resolve(process.env["USERPROFILE"] || process.env["HOMEPATH"] || "C:/Users/Administrator", ".claude", "debug");
+        import_public.pub.mkdir(debugDir);
+        const ts = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+        const logFile = path.resolve(debugDir, `aingdesk-mcp-${server.name}-${args.tool_name}-${ts}.json`);
+        import_public.pub.write_file(logFile, JSON.stringify({ server: server.name, tool: args.tool_name, args: toolArgs, push, text, raw }, null, 2));
+      } catch (e) {
+        import_log.logger.warn("\u5199\u5165 Claude \u8C03\u8BD5\u65E5\u5FD7\u5931\u8D25\uFF1A", e);
+      }
+      return import_public.pub.return_success(import_public.pub.lang("\u6267\u884C\u6210\u529F"), { server: server.name, tool: args.tool_name, args: toolArgs, push, text, raw });
+    } catch (e) {
+      import_log.logger.error("execute_mcp_tool \u5931\u8D25\uFF1A", e);
+      return import_public.pub.return_error(import_public.pub.lang("\u6267\u884C\u5931\u8D25"), e?.message || e);
+    }
+  }
+  /**
    * 获取常用的MCP服务器列表
    * @param args 
    * @returns {Promise<any>} - 返回常用的MCP服务器列表

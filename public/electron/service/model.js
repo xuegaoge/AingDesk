@@ -83,13 +83,16 @@ class ModelService {
       return [];
     }
     try {
+      console.log(`[ModelService] calling embedding for model ${model}...`);
       const res = await this.client.embeddings.create({
         model,
         input,
         encoding_format: "float"
       });
+      console.log(`[ModelService] embedding success.`);
       return res.data[0] || [];
     } catch (error) {
+      console.error(`[ModelService] embedding error:`, error);
       this.error = error;
       return [];
     }
@@ -237,9 +240,11 @@ class ModelService {
       return false;
     }
     try {
+      console.log(`[ModelService] connecting to ${this.baseUrl} with timeout 60000ms`);
       this.client = new import_openai.default({
         apiKey: this.apiKey,
-        baseURL: this.baseUrl
+        baseURL: this.baseUrl,
+        timeout: 6e4
       });
       return true;
     } catch (error) {

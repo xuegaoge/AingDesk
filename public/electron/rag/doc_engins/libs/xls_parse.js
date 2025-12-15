@@ -33,6 +33,7 @@ __export(xls_parse_exports, {
 module.exports = __toCommonJS(xls_parse_exports);
 var XLSX = __toESM(require("xlsx"));
 var path = __toESM(require("path"));
+var import_child_process = require("child_process");
 class ExcelParser {
   filename;
   ragName;
@@ -226,17 +227,72 @@ class ExcelParser {
   }
 }
 async function parse(filename, ragName) {
-  try {
-    const parser = new ExcelParser(filename, ragName);
-    const markdown = await parser.parse();
-    parser.dispose();
-    return markdown;
-  } catch (error) {
-    console.error("\u89E3\u6790 Excel \u6587\u4EF6\u5931\u8D25:", error);
-    return `# Excel\u89E3\u6790\u5931\u8D25
+  return new Promise((resolve, reject) => {
+    let scriptPath = __filename;
+    if (path.extname(scriptPath) === ".ts") {
+      scriptPath = path.join(process.cwd(), "public", "electron", "rag", "doc_engins", "libs", "xls_parse.js");
+    }
+    const child = (0, import_child_process.spawn)(process.execPath, [scriptPath, filename, ragName], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+    child.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        console.error(`[XlsParse] Worker exited with code ${code}: ${stderr}`);
+        resolve(`# \u89E3\u6790\u5931\u8D25
 
-\u65E0\u6CD5\u89E3\u6790Excel\u6587\u4EF6\u3002\u9519\u8BEF: ${error.message || "\u672A\u77E5\u9519\u8BEF"}`;
-  }
+Excel\u89E3\u6790\u8FDB\u7A0B\u5F02\u5E38\u9000\u51FA (Code ${code})`);
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout.trim());
+        if (result.success) {
+          resolve(result.data);
+        } else {
+          resolve(`# \u89E3\u6790\u5931\u8D25
+
+${result.error}`);
+        }
+      } catch (error) {
+        console.error(`[XlsParse] Failed to parse worker output: ${stdout}`);
+        resolve(`# \u89E3\u6790\u5931\u8D25
+
+\u89E3\u6790\u7ED3\u679C\u683C\u5F0F\u9519\u8BEF: ${error.message}`);
+      }
+    });
+    child.on("error", (error) => {
+      console.error(`[XlsParse] Failed to spawn worker: ${error}`);
+      resolve(`# \u89E3\u6790\u5931\u8D25
+
+\u65E0\u6CD5\u542F\u52A8\u89E3\u6790\u8FDB\u7A0B: ${error.message}`);
+    });
+  });
+}
+if (require.main === module) {
+  (async () => {
+    const filename = process.argv[2];
+    const ragName = process.argv[3];
+    if (!filename || !ragName) {
+      console.error("Usage: node xls_parse.js <filename> <ragName>");
+      process.exit(1);
+    }
+    try {
+      const parser = new ExcelParser(filename, ragName);
+      const markdown = await parser.parse();
+      parser.dispose();
+      process.stdout.write(JSON.stringify({ success: true, data: markdown }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ success: false, error: error.message || "\u672A\u77E5\u9519\u8BEF" }));
+    }
+  })();
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {

@@ -225,31 +225,46 @@ class PdfParser {
     let popplerBin = this.get_poppler_bin();
     if (!import_public.pub.file_exists(popplerBin)) {
       if (!import_public.pub.is_windows()) {
+        import_log.logger.warn(`[PdfParser] Poppler not found on non-Windows. OCR unavailable: ${popplerBin}`);
         return "";
       }
+      import_log.logger.info(`[PdfParser] Poppler not found, installing: ${popplerBin}`);
       await this.install_poppler();
     }
     if (!import_public.pub.file_exists(popplerBin)) {
-      console.log("popplerBin", popplerBin);
+      import_log.logger.error(`[PdfParser] Poppler still not found after install: ${popplerBin}`);
       return "";
     }
     let imageTmpPath = import_path.default.resolve(import_public.pub.get_user_data_path(), "tmp", "pdf2image", import_public.pub.md5(this.filename));
     if (!import_public.pub.file_exists(imageTmpPath)) {
       import_public.pub.mkdir(imageTmpPath);
     }
-    let command = `${popplerBin} ${this.filename} ${imageTmpPath}/tmp`;
+    let command = `"${popplerBin}" -png "${this.filename}" "${imageTmpPath}/img"`;
     let result = "";
-    await new Promise((resolve, reject) => {
-      (0, import_child_process.exec)(command, (error, stdout, stderr) => {
-        if (error) {
-          console.error(`pdf to images error: ${error.message}`);
-          reject(error);
-        } else {
-          resolve(stdout);
-        }
+    import_log.logger.info(`[PdfParser] Extracting images from PDF: ${import_path.default.basename(this.filename)}`);
+    import_log.logger.info(`[PdfParser] Command: ${command}`);
+    try {
+      await new Promise((resolve, reject) => {
+        (0, import_child_process.exec)(command, (error, stdout, stderr) => {
+          if (error) {
+            import_log.logger.error(`[PdfParser] pdfimages error: ${error.message}`);
+            if (stderr) import_log.logger.error(`[PdfParser] stderr: ${stderr}`);
+            reject(error);
+          } else {
+            resolve(stdout);
+          }
+        });
       });
-    });
+    } catch (cmdError) {
+      import_log.logger.error(`[PdfParser] Failed to extract images:`, cmdError);
+      return "";
+    }
     let imageList = import_public.pub.readdir(imageTmpPath);
+    if (!imageList || imageList.length === 0) {
+      import_log.logger.warn(`[PdfParser] No images extracted: ${import_path.default.basename(this.filename)}`);
+      return "";
+    }
+    import_log.logger.info(`[PdfParser] Extracted ${imageList.length} images, starting OCR...`);
     let worker = await (0, import_image_parse.initializeWorker)();
     for (let imageFile of imageList) {
       try {

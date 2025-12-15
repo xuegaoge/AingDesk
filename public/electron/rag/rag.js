@@ -220,8 +220,8 @@ class Rag {
    * @param ragName:string rag名称
    * @returns Promise<any>
    */
-  async parseDocument(filename, ragName, saveToFile) {
-    return await (0, import_doc.parseDocument)(filename, ragName, saveToFile);
+  async parseDocument(filename, ragName, saveToFile, customOutputFilename) {
+    return await (0, import_doc.parseDocument)(filename, ragName, saveToFile, customOutputFilename);
   }
   /**
    * 检查文档表是否存在
@@ -357,6 +357,36 @@ class Rag {
     return await import_vector_lancedb.LanceDBManager.dropTable(import_public.pub.md5(ragName));
   }
   /**
+   * 批量将文档添加到数据库
+   * @param fileList:Array<{filename: string, dstFile: string}> 文件列表
+   * @param ragName:string rag名称
+   * @returns Promise<any>
+   */
+  async addDocumentsToDB(fileList, ragName, separators, chunkSize, overlapSize) {
+    await this.createDocTable(this.docTable);
+    await this.checkDocTableSchema(this.docTable);
+    let dataDir = import_public.pub.get_data_path();
+    let repDataDir = "{DATA_DIR}";
+    let records = [];
+    for (let file of fileList) {
+      records.push({
+        doc_id: import_public.pub.uuid(),
+        doc_name: path.basename(file.filename),
+        doc_file: file.dstFile.replace(dataDir, repDataDir),
+        md_file: "",
+        doc_rag: ragName,
+        doc_abstract: "",
+        doc_keywords: [],
+        is_parsed: 0,
+        update_time: import_public.pub.time(),
+        separators,
+        chunk_size: chunkSize,
+        overlap_size: overlapSize
+      });
+    }
+    return await import_vector_lancedb.LanceDBManager.addRecord(this.docTable, records);
+  }
+  /**
    * 将文档添加到数据库
    * @param filename:string 文件名
    * @param ragName:string rag名称
@@ -400,9 +430,19 @@ class Rag {
   async getRagInfo(ragName) {
     let ragConfigFile = path.resolve(import_public.pub.get_data_path(), "rag", ragName, "config.json");
     if (import_public.pub.file_exists(ragConfigFile)) {
-      let result = JSON.parse(import_public.pub.read_file(ragConfigFile));
-      if (!result.supplierName) result.supplierName = "ollama";
-      return result;
+      try {
+        let content = import_public.pub.read_file(ragConfigFile);
+        if (!content || content.trim() === "") {
+          console.error(`[Rag.getRagInfo] Config file is empty: ${ragConfigFile}`);
+          return null;
+        }
+        let result = JSON.parse(content);
+        if (!result.supplierName) result.supplierName = "ollama";
+        return result;
+      } catch (e) {
+        console.error(`[Rag.getRagInfo] Failed to parse config for ${ragName}:`, e);
+        return null;
+      }
     }
     return null;
   }
@@ -497,9 +537,10 @@ class Rag {
    * @returns Promise<any>
    */
   async reindexDocument(ragName, docId) {
-    let docContentList = await import_vector_lancedb.LanceDBManager.queryRecord(this.docTable, "doc_id=" + docId);
+    let docContentList = await import_vector_lancedb.LanceDBManager.queryRecord(this.docTable, "doc_id='" + docId + "'");
     if (docContentList.length > 0) {
-      await import_vector_lancedb.LanceDBManager.updateRecord(ragName, { where: `doc_id='${docId}'`, values: { is_parsed: 0 } });
+      let docName = docContentList[0]?.doc_name || "unknown";
+      await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${docId}'`, values: { is_parsed: 0 } }, docName);
     }
     return true;
   }
@@ -509,7 +550,7 @@ class Rag {
    * @returns Promise<any>
    */
   async reindexRag(argName) {
-    await import_vector_lancedb.LanceDBManager.updateRecord(argName, { where: `doc_aag='${argName}'`, values: { is_parsed: 0 } });
+    await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_rag='${argName}'`, values: { is_parsed: 0 } }, `RAG\u5E93:${argName}`);
     return true;
   }
   /**

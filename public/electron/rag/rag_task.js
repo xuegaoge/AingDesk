@@ -36,19 +36,147 @@ var import_rag = require("./rag");
 var import_service = require("../service/index");
 var import_log = require("ee-core/log");
 var import_path = __toESM(require("path"));
+var import_child_process = require("child_process");
+var import_iconv_lite = __toESM(require("iconv-lite"));
+var import_fs = __toESM(require("fs"));
 class RagTask {
   docTable = "doc_table";
+  initialized = false;
+  consoleEncoding = null;
+  /**
+   * 重置卡住的任务
+   * 启动时调用，将所有状态为1 (处理中) 的任务重置为 0 (待处理)，以便重新尝试
+   */
+  async resetStuckTasks() {
+    import_log.logger.info("[RagTask] Checking for stuck tasks (is_parsed=1)...");
+    try {
+      const stuckDocs = await import_vector_lancedb.LanceDBManager.queryRecord(this.docTable, "is_parsed=1");
+      if (stuckDocs && stuckDocs.length > 0) {
+        import_log.logger.warn(`[RagTask] Found ${stuckDocs.length} stuck tasks. Resetting to pending state.`);
+        for (const doc of stuckDocs) {
+          import_log.logger.warn(`[RagTask] Resetting stuck task: ${import_path.default.basename(doc.doc_file || "unknown")} (${doc.doc_id})`);
+          await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, {
+            where: `doc_id='${doc.doc_id}'`,
+            values: { is_parsed: 0 }
+          }, import_path.default.basename(doc.doc_file || "unknown"));
+        }
+      } else {
+        import_log.logger.info("[RagTask] No stuck tasks found.");
+      }
+    } catch (error) {
+      import_log.logger.error("[RagTask] Error resetting stuck tasks:", error);
+    }
+  }
+  /**
+   * 清除未完成的任务队列
+   */
+  async clearTaskQueue() {
+    import_log.logger.info("[RagTask] Clearing task queue (is_parsed != 3)...");
+    try {
+      await import_vector_lancedb.LanceDBManager.deleteRecord(this.docTable, "is_parsed != 3");
+      import_log.logger.info("[RagTask] Task queue cleared.");
+      return true;
+    } catch (error) {
+      import_log.logger.error("[RagTask] Error clearing task queue:", error);
+      return false;
+    }
+  }
   /**
    * 获取未解析文档
    * @returns Promise<any>
    */
   async getNotParseDocument() {
     let result = await import_vector_lancedb.LanceDBManager.queryRecord(this.docTable, "is_parsed=0");
+    if (result && result.length > 0) {
+      const dataDir = import_public.pub.get_data_path();
+      const repDataDir = "{DATA_DIR}";
+      result.sort((a, b) => {
+        let aSize = 0;
+        let bSize = 0;
+        try {
+          const aFile = a.doc_file.replace(repDataDir, dataDir);
+          aSize = import_fs.default.statSync(aFile).size / (1024 * 1024);
+        } catch (e) {
+          aSize = 0;
+        }
+        try {
+          const bFile = b.doc_file.replace(repDataDir, dataDir);
+          bSize = import_fs.default.statSync(bFile).size / (1024 * 1024);
+        } catch (e) {
+          bSize = 0;
+        }
+        const aIsLarge = aSize > 50;
+        const bIsLarge = bSize > 50;
+        if (aIsLarge && !bIsLarge) return 1;
+        if (!aIsLarge && bIsLarge) return -1;
+        return aSize - bSize;
+      });
+    }
     return result;
   }
   async getNotEmbeddingDocument() {
     let result = await import_vector_lancedb.LanceDBManager.queryRecord(this.docTable, "is_parsed=2");
+    if (result && result.length > 0) {
+      const dataDir = import_public.pub.get_data_path();
+      const repDataDir = "{DATA_DIR}";
+      result.sort((a, b) => {
+        let aSize = 0;
+        let bSize = 0;
+        try {
+          const aFile = a.md_file ? a.md_file.replace(repDataDir, dataDir) : "";
+          if (aFile && import_fs.default.existsSync(aFile)) {
+            aSize = import_fs.default.statSync(aFile).size / (1024 * 1024);
+          }
+        } catch (e) {
+          aSize = 0;
+        }
+        try {
+          const bFile = b.md_file ? b.md_file.replace(repDataDir, dataDir) : "";
+          if (bFile && import_fs.default.existsSync(bFile)) {
+            bSize = import_fs.default.statSync(bFile).size / (1024 * 1024);
+          }
+        } catch (e) {
+          bSize = 0;
+        }
+        const aIsLarge = aSize > 50;
+        const bIsLarge = bSize > 50;
+        if (aIsLarge && !bIsLarge) return 1;
+        if (!aIsLarge && bIsLarge) return -1;
+        return aSize - bSize;
+      });
+    }
     return result;
+  }
+  getConsoleEncoding() {
+    if (this.consoleEncoding) return this.consoleEncoding;
+    if (process.platform === "win32") {
+      try {
+        const output = (0, import_child_process.execSync)("chcp").toString();
+        if (output.includes("936")) {
+          this.consoleEncoding = "gbk";
+        } else {
+          this.consoleEncoding = "utf-8";
+        }
+      } catch (e) {
+        this.consoleEncoding = "utf-8";
+      }
+    } else {
+      this.consoleEncoding = "utf-8";
+    }
+    return this.consoleEncoding;
+  }
+  logToTerminal(msg) {
+    const encoding = this.getConsoleEncoding();
+    if (encoding === "gbk") {
+      try {
+        const buf = import_iconv_lite.default.encode(msg + "\n", "gbk");
+        process.stdout.write(buf);
+      } catch (e) {
+        console.log(msg);
+      }
+    } else {
+      console.log(msg);
+    }
   }
   /**
    * 文档分割 - 将长文本分割成小块，尊重Markdown文档结构
@@ -197,10 +325,10 @@ class RagTask {
     return chunkList;
   }
   // 自动识别分隔符
-  defaultSeparators(separators, filename, text) {
+  defaultSeparators(separators, filename2, text) {
     if (separators.length == 0) {
       separators = [];
-      if (filename.endsWith(".xlsx") || filename.endsWith(".xls") || filename.endsWith(".csv")) {
+      if (filename2.endsWith(".xlsx") || filename2.endsWith(".xls") || filename2.endsWith(".csv")) {
         separators = ["\n"];
         return separators;
       }
@@ -245,8 +373,8 @@ class RagTask {
     return sepList;
   }
   // 获取文档名称
-  getDocName(filename) {
-    let docName = import_path.default.basename(filename);
+  getDocName(filename2) {
+    let docName = import_path.default.basename(filename2);
     if (docName.includes(".")) {
       docName = docName.replace(".md", "").split(".").slice(0, -1).join(".");
     }
@@ -259,16 +387,16 @@ class RagTask {
    * @param chunkSize <number> 每个块的大小
    * @returns 
    */
-  splitText(filename, text, separators, chunkSize, overlapSize) {
+  splitText(filename2, text, separators, chunkSize, overlapSize) {
     let chunks = [];
     let i = 0;
     if (separators.length == 0) {
-      separators = this.defaultSeparators(separators, filename, text);
+      separators = this.defaultSeparators(separators, filename2, text);
       if (separators.length == 0) {
         return this.docChunk(text, chunkSize, overlapSize);
       }
     }
-    let docName = this.getDocName(filename);
+    let docName = this.getDocName(filename2);
     let sepList = this.formatSep(separators);
     let sep = sepList[i];
     let chunkList = this.split(text, sep);
@@ -285,27 +413,52 @@ class RagTask {
     return chunks;
   }
   // 后台解析任务
-  async parseTask() {
-    const sleep = 5 * 1e3;
-    let self = this;
-    setTimeout(async () => {
-      if (global.changePath) {
-        global.changePath = false;
-        import_service.indexService.copyDataPath();
+  parseTask() {
+    import_log.logger.info("[RagTask] Starting parallel processing loops...");
+    this.runParseLoop();
+    this.runEmbedLoop();
+  }
+  async runParseLoop() {
+    const sleep = 5e3;
+    while (true) {
+      try {
+        if (!this.initialized) {
+          await this.resetStuckTasks();
+          this.initialized = true;
+        }
+        if (global.changePath) {
+          import_log.logger.info("[RagTask] Detected changePath, copying data path...");
+          global.changePath = false;
+          import_service.indexService.copyDataPath();
+        }
+        await this.parse();
+      } catch (e) {
+        import_log.logger.error("[RagTask] Parse loop error:", e);
       }
-      await self.parse();
-      await self.embed();
-      self.parseTask();
-    }, sleep);
+      await new Promise((r) => setTimeout(r, sleep));
+    }
+  }
+  async runEmbedLoop() {
+    const sleep = 5e3;
+    while (true) {
+      try {
+        await this.embed();
+      } catch (e) {
+        import_log.logger.error("[RagTask] Embed loop error:", e);
+      }
+      await new Promise((r) => setTimeout(r, sleep));
+    }
   }
   // 当向量数据足够多时，切换到余弦相似度索引
   async switchToCosineIndex() {
+    this.logToTerminal("[RagTask] switchToCosineIndex called.");
     let tableList = import_public.pub.readdir(import_public.pub.get_data_path() + "/rag/vector_db");
     let indexTipsPath = import_public.pub.get_data_path() + "/rag/index_tips";
     if (!import_public.pub.file_exists(indexTipsPath)) {
       import_public.pub.mkdir(indexTipsPath);
     }
     for (let tablePath of tableList) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
       let tableName = tablePath.split("/").pop()?.replace(".lance", "");
       if (tableName?.length !== 32) {
         continue;
@@ -327,28 +480,210 @@ class RagTask {
    */
   async parse() {
     let notParseDocument = await this.getNotParseDocument();
+    if (!notParseDocument || notParseDocument.length === 0) {
+      return;
+    }
+    this.logToTerminal("[RagTask] parse() started.");
+    this.logToTerminal(`[RagTask] Found ${notParseDocument.length} unparsed documents.`);
+    if (notParseDocument && notParseDocument.length > 10) {
+      notParseDocument = notParseDocument.slice(0, 10);
+    }
     let dataDir = import_public.pub.get_data_path();
     let repDataDir = "{DATA_DIR}";
     let ragObj = new import_rag.Rag();
-    for (let doc of notParseDocument) {
-      try {
-        let filename = doc.doc_file.replace(repDataDir, dataDir);
-        let parseDoc = await ragObj.parseDocument(filename, doc.doc_rag, true);
-        if (!parseDoc.content) {
-          await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } });
-          continue;
+    const concurrency = 6;
+    for (let i = 0; i < notParseDocument.length; i += concurrency) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const batch = notParseDocument.slice(i, i + concurrency);
+      await Promise.all(batch.map(async (doc) => {
+        try {
+          let filename2 = doc.doc_file.replace(repDataDir, dataDir);
+          const baseName = import_path.default.basename(filename2);
+          const displayName = doc.doc_name || baseName;
+          this.logToTerminal(`[RagTask] Marking file as processing: ${displayName} (${doc.doc_id})`);
+          import_log.logger.info(`[RagTask] Marking file as processing: ${displayName} (${doc.doc_id})`);
+          try {
+            await Promise.race([
+              import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: 1 } }, displayName),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("Update status timeout")), 6e4))
+            ]);
+          } catch (err) {
+            this.logToTerminal(`[RagTask] Failed to mark processing status for ${doc.doc_id}, skipping.`);
+            import_log.logger.error(`[RagTask] Failed to mark processing status for ${doc.doc_id}, skipping.`, err);
+            return;
+          }
+          this.logToTerminal(`[RagTask] Start parsing file: ${displayName} (ID: ${doc.doc_id})`);
+          import_log.logger.info(`[RagTask] Start parsing file: ${displayName} (ID: ${doc.doc_id})`);
+          let timeoutMs = 300 * 1e3;
+          try {
+            const stats = import_fs.default.statSync(filename2);
+            const fileSizeMB = stats.size / (1024 * 1024);
+            if (fileSizeMB > 50) {
+              this.logToTerminal(`[RagTask] WARNING: File ${displayName} is large (${fileSizeMB.toFixed(2)} MB). Increasing timeout.`);
+              import_log.logger.warn(`[RagTask] File ${displayName} is large (${fileSizeMB.toFixed(2)} MB).`);
+              timeoutMs = 1800 * 1e3;
+            }
+          } catch (e) {
+          }
+          const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error(`Parse timeout after ${timeoutMs}ms`)), timeoutMs));
+          let fileExt = import_path.default.extname(doc.doc_name);
+          let fileNameNoExt = import_path.default.basename(doc.doc_name, fileExt);
+          let customOutputName = `${fileNameNoExt}_${doc.doc_id}${fileExt}.md`;
+          const progressInterval = setInterval(() => {
+            this.logToTerminal(`[RagTask] Still parsing ${displayName} (${doc.doc_id})...`);
+          }, 3e4);
+          let parseDoc;
+          try {
+            parseDoc = await Promise.race([
+              ragObj.parseDocument(filename2, doc.doc_rag, true, customOutputName),
+              timeout
+            ]);
+          } finally {
+            clearInterval(progressInterval);
+          }
+          this.logToTerminal(`[RagTask] Finished parsing file: ${displayName}`);
+          import_log.logger.info(`[RagTask] Finished parsing file: ${displayName}`);
+          if (parseDoc) {
+            this.logToTerminal(`[RagTask] Parse result for ${displayName}: Success=${parseDoc.content ? "Yes" : "No"}, ContentLength=${parseDoc.content ? parseDoc.content.length : 0}, SavedPath=${parseDoc.savedPath || "None"}`);
+          } else {
+            this.logToTerminal(`[RagTask] Parse result for ${displayName}: NULL`);
+          }
+          if (!parseDoc.content) {
+            this.logToTerminal(`[RagTask] No content parsed for ${displayName} (${doc.doc_id})`);
+            import_log.logger.warn(`[RagTask] No content parsed for ${displayName} (${doc.doc_id})`);
+            await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } }, displayName);
+            return;
+          }
+          if (parseDoc.savedPath) {
+            this.logToTerminal(`[RagTask] \u89E3\u6790\u4EA7\u51FA MD \u6587\u4EF6: ${parseDoc.savedPath}`);
+            import_log.logger.info(`[RagTask] \u89E3\u6790\u4EA7\u51FA MD \u6587\u4EF6: ${parseDoc.savedPath}`);
+          }
+          const postProcessPromise = (async () => {
+            this.logToTerminal(`[RagTask] Start generating abstract for ${displayName}`);
+            import_log.logger.info(`[RagTask] Start generating abstract for ${displayName}`);
+            const abstract = await Promise.race([
+              ragObj.generateAbstract(parseDoc.content),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("Generate abstract timeout")), 12e4))
+            ]);
+            this.logToTerminal(`[RagTask] Skip full-doc keywords for ${displayName}`);
+            import_log.logger.info(`[RagTask] Skip full-doc keywords for ${displayName}`);
+            const keywords = [];
+            const pdata = {
+              md_file: parseDoc.savedPath?.replace(dataDir, repDataDir),
+              doc_abstract: abstract,
+              is_parsed: 2,
+              update_time: import_public.pub.time()
+            };
+            this.logToTerminal(`[RagTask] Start updating record for ${displayName}`);
+            import_log.logger.info(`[RagTask] Start updating record for ${displayName}`);
+            await Promise.race([
+              import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: pdata }, displayName),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("Update success status timeout")), 6e4))
+            ]);
+            this.logToTerminal(`[RagTask] Successfully updated record for ${displayName}`);
+            import_log.logger.info(`[RagTask] Successfully updated record for ${displayName}`);
+            return true;
+          })();
+          await Promise.race([
+            postProcessPromise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Post-processing timeout")), 18e4))
+          ]);
+        } catch (e) {
+          this.logToTerminal(`[RagTask] [parseDocument]\u89E3\u6790\u6587\u6863\u5931\u8D25: ${e}`);
+          import_log.logger.error(import_public.pub.lang("[parseDocument]\u89E3\u6790\u6587\u6863\u5931\u8D25"), e);
+          try {
+            await Promise.race([
+              import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } }, doc.doc_name || import_path.default.basename(filename)),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("Update failed status timeout")), 6e4))
+            ]);
+          } catch (updateErr) {
+            import_log.logger.error(`[RagTask] Failed to mark failed status for ${doc.doc_id}`, updateErr);
+          }
         }
-        let pdata = {
-          md_file: parseDoc.savedPath?.replace(dataDir, repDataDir),
-          doc_abstract: await ragObj.generateAbstract(parseDoc.content),
-          doc_keywords: await ragObj.generateKeywords(parseDoc.content, 5),
-          is_parsed: 2,
-          update_time: import_public.pub.time()
+      }));
+    }
+  }
+  async processDocument(doc, dataDir, repDataDir, ragObj, ragNameList) {
+    let md_file = doc.md_file.replace(repDataDir, dataDir);
+    let fileName = doc.doc_name || import_path.default.basename(md_file);
+    try {
+      import_log.logger.info(`[RagTask] [${fileName}] 1. Start processing (${doc.doc_id})`);
+      if (!import_public.pub.file_exists(md_file)) {
+        import_log.logger.warn(`[RagTask] MD file not found for ${fileName} (${doc.doc_id}): ${md_file}`);
+        await Promise.race([
+          import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } }, fileName),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Update not found status timeout")), 6e4))
+        ]);
+        return;
+      }
+      this.logToTerminal(`[RagTask] [${fileName}] 2. Reading file...`);
+      let md_body = import_public.pub.read_file(md_file);
+      const chunkSize = doc.chunk_size || 1e3;
+      const overlap = 100;
+      this.logToTerminal(`[RagTask] [${fileName}] 3. Splitting text...`);
+      let chunks = this.splitText(doc.doc_file, md_body, doc.separators, chunkSize, overlap);
+      this.logToTerminal(`[RagTask] [${fileName}] Split into ${chunks.length} chunks.`);
+      let chunkList = [];
+      const logInterval = chunks.length > 1e3 ? 100 : chunks.length > 100 ? 20 : 5;
+      for (let j = 0; j < chunks.length; j++) {
+        let chunk = chunks[j];
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (j % logInterval === 0 || j === chunks.length - 1) {
+          this.logToTerminal(`[RagTask] [${fileName}] 4. Generating keywords: ${j + 1}/${chunks.length}`);
+        }
+        let chunkInfo = {
+          text: chunk,
+          docId: doc.doc_id,
+          tokens: import_public.pub.cutForSearch(chunk).join(" "),
+          keywords: await Promise.race([
+            ragObj.generateKeywords(chunk, 3),
+            new Promise((resolve) => setTimeout(() => resolve([]), 3e4))
+          ])
         };
-        await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: pdata });
+        chunkList.push(chunkInfo);
+      }
+      this.logToTerminal(`[RagTask] [${fileName}] 5. Adding to LanceDB (chunks: ${chunkList.length})...`);
+      let table = import_public.pub.md5(doc.doc_rag);
+      let ragInfo = await Promise.race([
+        ragObj.getRagInfo(doc.doc_rag),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Get RagInfo timeout")), 1e4))
+      ]);
+      try {
+        const texts = chunkList.map((i) => i.text);
+        const keywordsArr = chunkList.map((i) => i.keywords);
+        this.logToTerminal(`[RagTask] [${fileName}] Invoking LanceDBManager.addDocuments...`);
+        await Promise.race([
+          import_vector_lancedb.LanceDBManager.addDocuments(table, ragInfo.supplierName, ragInfo.embeddingModel, texts, keywordsArr, doc.doc_id),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Add documents timeout")), 3e5))
+        ]);
+        this.logToTerminal(`[RagTask] [${fileName}] LanceDBManager.addDocuments completed.`);
       } catch (e) {
-        import_log.logger.error(import_public.pub.lang("[parseDocument]\u89E3\u6790\u6587\u6863\u5931\u8D25"), e);
-        await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } });
+        import_log.logger.error(import_public.pub.lang("[addDocuments]\u6279\u91CF\u63D2\u5165\u6570\u636E\u5931\u8D25"), e);
+        const msg = String(e?.message || e);
+        if (msg.includes("Commit conflict") || msg.includes("concurrent commit")) {
+          return;
+        }
+        throw e;
+      }
+      this.logToTerminal(`[RagTask] [${fileName}] 6. Updating status...`);
+      await Promise.race([
+        import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: 3 } }, fileName),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Update success status timeout")), 6e4))
+      ]);
+      if (!ragNameList.includes(doc.doc_rag)) {
+        ragNameList.push(doc.doc_rag);
+      }
+      this.logToTerminal(`[RagTask] [${fileName}] Done.`);
+      import_log.logger.info(`[RagTask] [${fileName}] (${doc.doc_id}) Done.`);
+    } catch (error) {
+      import_log.logger.error(`[RagTask] Error processing document ${fileName} (${doc.doc_id})`, error);
+      try {
+        await Promise.race([
+          import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } }, fileName),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Update failed status timeout")), 6e4))
+        ]);
+      } catch (updateErr) {
+        import_log.logger.error(`[RagTask] Failed to update status to -1 for ${doc.doc_id}`, updateErr);
       }
     }
   }
@@ -358,49 +693,75 @@ class RagTask {
    */
   async embed() {
     try {
+      import_log.logger.info("[RagTask] Checking for embedding tasks...");
       let notEmbeddingDocument = await this.getNotEmbeddingDocument();
+      if (notEmbeddingDocument && notEmbeddingDocument.length > 0) {
+        import_log.logger.info(`[RagTask] Found ${notEmbeddingDocument.length} tasks in getNotEmbeddingDocument`);
+        notEmbeddingDocument.sort((a, b) => {
+          if (a.doc_rag === "PDF" && b.doc_rag !== "PDF") return -1;
+          if (a.doc_rag !== "PDF" && b.doc_rag === "PDF") return 1;
+          return 0;
+        });
+      }
+      if (!notEmbeddingDocument || notEmbeddingDocument.length === 0) {
+        return;
+      }
+      this.logToTerminal("[RagTask] embed() started.");
+      this.logToTerminal(`[RagTask] Found ${notEmbeddingDocument.length} unembedded documents.`);
+      if (notEmbeddingDocument && notEmbeddingDocument.length > 50) {
+        notEmbeddingDocument = notEmbeddingDocument.slice(0, 50);
+      }
       let dataDir = import_public.pub.get_data_path();
       let repDataDir = "{DATA_DIR}";
       let ragObj = new import_rag.Rag();
       let ragNameList = [];
-      for (let doc of notEmbeddingDocument) {
-        let md_file = doc.md_file.replace(repDataDir, dataDir);
-        if (!import_public.pub.file_exists(md_file)) {
-          continue;
+      const embedConcurrency = 1;
+      const executing = [];
+      for (const doc of notEmbeddingDocument) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const p = this.processDocument(doc, dataDir, repDataDir, ragObj, ragNameList).then(() => {
+          const index = executing.indexOf(p);
+          if (index > -1) {
+            executing.splice(index, 1);
+          }
+        });
+        executing.push(p);
+        if (executing.length >= embedConcurrency) {
+          await Promise.race(executing);
         }
-        let md_body = import_public.pub.read_file(md_file);
-        let chunks = this.splitText(doc.doc_file, md_body, doc.separators, doc.chunk_size, doc.overlap_size);
-        let chunkList = [];
-        for (let chunk of chunks) {
-          let chunkInfo = {
-            text: chunk,
-            docId: doc.doc_id,
-            tokens: import_public.pub.cutForSearch(chunk).join(" "),
-            keywords: await ragObj.generateKeywords(chunk, 5)
-          };
-          chunkList.push(chunkInfo);
-        }
-        let table = import_public.pub.md5(doc.doc_rag);
-        let ragInfo = await ragObj.getRagInfo(doc.doc_rag);
-        for (let checkInfo of chunkList) {
+      }
+      await Promise.all(executing);
+      if (ragNameList.length > 0) {
+        this.logToTerminal("[RagTask] Starting FTS index update for: " + ragNameList.join(", "));
+        import_log.logger.info("[RagTask] Starting FTS index update for: " + ragNameList.join(", "));
+        for (let ragName of ragNameList) {
           try {
-            await import_vector_lancedb.LanceDBManager.addDocument(table, ragInfo.supplierName, ragInfo.embeddingModel, checkInfo.text, checkInfo.keywords, checkInfo.docId, checkInfo.tokens);
-          } catch (e) {
-            import_log.logger.error(import_public.pub.lang("[addDocument]\u63D2\u5165\u6570\u636E\u5931\u8D25"), e);
-            await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: -1 } });
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            let encryptTableName = import_public.pub.md5(ragName);
+            this.logToTerminal(`[RagTask] Creating index for ${ragName}...`);
+            import_log.logger.info(`[RagTask] Creating index for ${ragName}...`);
+            await Promise.race([
+              import_vector_lancedb.LanceDBManager.createDocFtsIndex(encryptTableName),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("Create FTS Index timeout")), 3e5))
+            ]);
+            this.logToTerminal(`[RagTask] Optimizing table ${ragName}...`);
+            import_log.logger.info(`[RagTask] Optimizing table ${ragName}...`);
+            await Promise.race([
+              import_vector_lancedb.LanceDBManager.optimizeTable(encryptTableName),
+              new Promise((_, reject) => setTimeout(() => reject(new Error("Optimize Table timeout")), 3e5))
+            ]);
+            this.logToTerminal(`[RagTask] Finished index update for ${ragName}`);
+            import_log.logger.info(`[RagTask] Finished index update for ${ragName}`);
+          } catch (err) {
+            this.logToTerminal(`[RagTask] Failed to update index for ${ragName}: ${err}`);
+            import_log.logger.error(`[RagTask] Failed to update index for ${ragName}`, err);
           }
         }
-        await import_vector_lancedb.LanceDBManager.updateRecord(this.docTable, { where: `doc_id='${doc.doc_id}'`, values: { is_parsed: 3 } });
-        if (!ragNameList.includes(doc.doc_rag)) {
-          ragNameList.push(doc.doc_rag);
-        }
-      }
-      for (let ragName of ragNameList) {
-        let encryptTableName = import_public.pub.md5(ragName);
-        await import_vector_lancedb.LanceDBManager.createDocFtsIndex(encryptTableName);
-        await import_vector_lancedb.LanceDBManager.optimizeTable(encryptTableName);
+        this.logToTerminal("[RagTask] All index updates completed.");
+        import_log.logger.info("[RagTask] All index updates completed.");
       }
     } catch (e) {
+      this.logToTerminal(`[RagTask] [embed]\u5D4C\u5165\u6587\u6863\u5931\u8D25: ${e}`);
       import_log.logger.error(import_public.pub.lang("[embed]\u5D4C\u5165\u6587\u6863\u5931\u8D25"), e);
       return e;
     }

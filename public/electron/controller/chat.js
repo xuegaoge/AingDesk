@@ -85,7 +85,13 @@ class ChatController {
    */
   async get_model_list() {
     (0, import_tochat.clearModelListInfo)();
-    let ollamaModelList = await import_ollama.ollamaService.model_list();
+    let ollamaModelList = [];
+    try {
+      ollamaModelList = await import_ollama.ollamaService.model_list();
+    } catch (e) {
+      import_log.logger.error(import_public.pub.lang("\u83B7\u53D6\u6A21\u578B\u80FD\u529B\u5931\u8D25"), e);
+      ollamaModelList = [];
+    }
     try {
       MODEL_LIST_RETRY++;
       const ollama = import_public.pub.init_ollama();

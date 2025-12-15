@@ -291,20 +291,29 @@ class McpService {
    * @returns {Promise<any>} - 返回同步结果
    */
   async sync_cloud_mcp() {
-    let downloadUrl = `https://aingdesk.bt.cn/config/common-mcp-server.json`;
-    let res = await import_public.pub.httpRequest(downloadUrl);
-    if (res.statusCode !== 200) {
+    try {
+      let downloadUrl = `https://aingdesk.bt.cn/config/common-mcp-server.json`;
+      let res = await import_public.pub.httpRequest(downloadUrl);
+      if (!res || res.statusCode !== 200) {
+        return import_public.pub.return_error(import_public.pub.lang("\u83B7\u53D6\u5931\u8D25"));
+      }
+      let commonMcpConfig = res.body;
+      if (typeof commonMcpConfig === "string") {
+        try {
+          commonMcpConfig = JSON.parse(commonMcpConfig);
+        } catch (e) {
+          return import_public.pub.return_error(import_public.pub.lang("\u914D\u7F6E\u6587\u4EF6\u683C\u5F0F\u9519\u8BEF"));
+        }
+      }
+      if (!commonMcpConfig || !commonMcpConfig.mcpServers) {
+        return import_public.pub.return_error(import_public.pub.lang("\u914D\u7F6E\u6587\u4EF6\u683C\u5F0F\u9519\u8BEF"));
+      }
+      mcpService.save_common_mcp_config(commonMcpConfig);
+      return import_public.pub.return_success(import_public.pub.lang("\u540C\u6B65\u6210\u529F"));
+    } catch (e) {
+      import_log.logger.error("sync_cloud_mcp failed:", e);
       return import_public.pub.return_error(import_public.pub.lang("\u83B7\u53D6\u5931\u8D25"));
     }
-    let commonMcpConfig = res.body;
-    if (typeof commonMcpConfig === "string") {
-      commonMcpConfig = JSON.parse(commonMcpConfig);
-    }
-    if (!commonMcpConfig.mcpServers) {
-      return import_public.pub.return_error(import_public.pub.lang("\u914D\u7F6E\u6587\u4EF6\u683C\u5F0F\u9519\u8BEF"));
-    }
-    mcpService.save_common_mcp_config(commonMcpConfig);
-    return import_public.pub.return_success(import_public.pub.lang("\u540C\u6B65\u6210\u529F"));
   }
 }
 McpService.toString = () => "[class McpService]";

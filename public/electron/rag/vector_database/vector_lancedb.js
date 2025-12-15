@@ -58,7 +58,7 @@ class LanceDBManager {
       }
       let oldSize = import_public.pub.getDirSize(dataPath);
       const db = await lancedb.connect(import_public.pub.get_db_path());
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       await tableObj.optimize({
         deleteUnverified: true,
         cleanupOlderThan: /* @__PURE__ */ new Date()
@@ -207,39 +207,58 @@ time: ${endTime - startTime}s`);
    * @returns 向量嵌入
    * @throws 如果嵌入生成失败或维度不匹配
    */
-  static async getEmbedding(supplierName, model, text) {
+  static async getEmbedding(supplierName2, model2, text) {
     const metrics = this.startMetrics(`\u751F\u6210\u5D4C\u5165 (${text.substring(0, 30)}...)`);
-    let key = import_public.pub.md5(`${supplierName}-${model}-${text}`);
+    console.log(`[LanceDB] getEmbedding started for: ${text.substring(0, 30)}... (Supplier: ${supplierName2}, Model: ${model2})`);
+    let key = import_public.pub.md5(`${supplierName2}-${model2}-${text}`);
     let embedding = await this.getEmbeddingCache(key);
     if (embedding.length > 0) {
       return embedding;
     }
     try {
       let res;
-      if (supplierName == "ollama") {
-        const ollama = import_public.pub.init_ollama();
-        res = await ollama.embeddings({
-          model,
-          prompt: text
-        });
-      } else {
-        let modelService = new import_model.ModelService(supplierName);
-        res = await modelService.embedding(model, text);
-        modelService.destroy();
-        if (!res) {
-          throw new Error(modelService.error);
+      let lastError;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          if (supplierName2 == "ollama") {
+            const ollama = import_public.pub.init_ollama();
+            res = await ollama.embeddings({
+              model: model2,
+              prompt: text
+            });
+          } else {
+            let modelService = new import_model.ModelService(supplierName2);
+            res = await modelService.embedding(model2, text);
+            modelService.destroy();
+            if (!res) {
+              throw new Error(modelService.error);
+            }
+          }
+          if (!res.embedding || res.embedding.length !== this.DIMENSION) {
+            if (!res.embedding) {
+              throw new Error(`\u5D4C\u5165\u7EF4\u5EA6\u9519\u8BEF: \u671F\u671B ${this.DIMENSION}, \u5B9E\u9645 ${res.embedding ? res.embedding.length : 0}, \u6A21\u578B: ${model2}, \u6587\u672C: ${text}`);
+            }
+            if (res.embedding && res.embedding.length < this.DIMENSION) {
+              const padding = new Array(this.DIMENSION - res.embedding.length).fill(0);
+              res.embedding = res.embedding.concat(padding);
+            }
+          }
+          console.log(`[LanceDB] Successfully retrieved embedding. Dimensions: ${res.embedding.length}`);
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt < 5) {
+            import_log.logger.warn(`[LanceDB] \u83B7\u53D6\u5D4C\u5165\u5931\u8D25\uFF0C\u6B63\u5728\u91CD\u8BD5 (${attempt}/5): ${err.message}`);
+            await new Promise((resolve) => setTimeout(resolve, 2e3 * attempt));
+          } else {
+            import_log.logger.error(`[LanceDB] getEmbedding failed for: ${text.substring(0, 30)}... (Supplier: ${supplierName2}, Model: ${model2}): ${err.message}`);
+            throw err;
+          }
         }
       }
-      if (!res.embedding || res.embedding.length !== this.DIMENSION) {
-        if (!res.embedding) {
-          throw new Error(`\u5D4C\u5165\u7EF4\u5EA6\u9519\u8BEF: \u671F\u671B ${this.DIMENSION}, \u5B9E\u9645 ${res.embedding ? res.embedding.length : 0}, \u6A21\u578B: ${model}, \u6587\u672C: ${text}`);
-        }
-        if (res.embedding && res.embedding.length < this.DIMENSION) {
-          const padding = new Array(this.DIMENSION - res.embedding.length).fill(0);
-          res.embedding = res.embedding.concat(padding);
-        }
-      }
+      console.log(`[LanceDB] Setting embedding cache for key: ${key}...`);
       await this.setEmbeddingCache(key, res.embedding);
+      console.log(`[LanceDB] Cache set successfully.`);
       return res.embedding;
     } catch (error) {
       throw new Error(`\u751F\u6210\u5D4C\u5165\u65F6\u51FA\u9519: ${error.message}`);
@@ -268,7 +287,7 @@ time: ${endTime - startTime}s`);
    * @param initialText 初始文本
    * @returns 成功创建的表名
    */
-  static async createTable(tableName, supplierName, model, initialText) {
+  static async createTable(tableName, supplierName2, model2, initialText) {
     const metrics = this.startMetrics(`\u521B\u5EFA\u8868 ${tableName}`);
     this.ensureDatabaseDirectory();
     const db = await lancedb.connect(import_public.pub.get_db_path());
@@ -276,7 +295,7 @@ time: ${endTime - startTime}s`);
       if (await this.tableExists(db, tableName)) {
         throw new Error(`\u8868 "${tableName}" \u5DF2\u5B58\u5728`);
       }
-      const embedding = await this.getEmbedding(supplierName, model, initialText);
+      const embedding = await this.getEmbedding(supplierName2, model2, initialText);
       const tableObj = await db.createTable(tableName, [{
         id: "1",
         doc: initialText,
@@ -384,7 +403,7 @@ time: ${endTime - startTime}s`);
   static async createDocFtsIndex(tableName) {
     try {
       const db = await lancedb.connect(import_public.pub.get_db_path());
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       let indexName = "doc_idx";
       let indexStats = await tableObj.indexStats(indexName);
       if (indexStats) {
@@ -434,7 +453,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       for (const indexKey of indexKeys) {
         let indexName = indexKey.key + "_idx";
         const indexStats = await tableObj.indexStats(indexName);
@@ -499,7 +518,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       await tableObj.dropIndex(indexKey);
       return true;
     } catch (e) {
@@ -517,18 +536,18 @@ time: ${endTime - startTime}s`);
    * @param text 要添加的文本
    * @returns 添加的记录ID
    */
-  static async addDocument(tableName, supplierName, model, text, keywords, docId, tokens) {
+  static async addDocument(tableName, supplierName2, model2, text, keywords, docId, tokens) {
     const metrics = this.startMetrics(`\u6DFB\u52A0\u6587\u6863\u5230\u8868 ${tableName}`);
     this.ensureDatabaseDirectory();
     let db = await lancedb.connect(import_public.pub.get_db_path());
     try {
       if (!await this.tableExists(db, tableName)) {
-        await this.createTable(tableName, supplierName, model, text);
+        await this.createTable(tableName, supplierName2, model2, text);
         await db.close();
         db = await lancedb.connect(import_public.pub.get_db_path());
       }
-      const tableObj = await db.openTable(tableName);
-      const embedding = await this.getEmbedding(supplierName, model, text);
+      let tableObj = await db.openTable(tableName);
+      const embedding = await this.getEmbedding(supplierName2, model2, text);
       const id = import_public.pub.uuid();
       await tableObj.add([{
         id,
@@ -582,12 +601,24 @@ time: ${endTime - startTime}s`);
   static async addRecord(tableName, record) {
     const metrics = this.startMetrics(`\u6DFB\u52A0\u6587\u6863\u5230\u8868 ${tableName}`);
     this.ensureDatabaseDirectory();
-    const db = await lancedb.connect(import_public.pub.get_db_path());
+    let db = await lancedb.connect(import_public.pub.get_db_path());
     try {
       if (!await this.tableExists(db, tableName)) {
-        throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
+        await db.close();
+        try {
+          await this.createTable(tableName, supplierName, model, texts[0]);
+        } catch (err) {
+          const msg = String(err?.message || err);
+          if (!msg.includes("\u5DF2\u5B58\u5728")) {
+            import_log.logger.warn(`[LanceDB] \u81EA\u52A8\u521B\u5EFA\u8868\u9047\u5230\u9519\u8BEF (\u53EF\u80FD\u662F\u5E76\u53D1): ${msg}`);
+          }
+        }
+        db = await lancedb.connect(import_public.pub.get_db_path());
+        if (!await this.tableExists(db, tableName)) {
+          throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728\uFF0C\u4E14\u81EA\u52A8\u521B\u5EFA\u5931\u8D25`);
+        }
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       await tableObj.add(record);
       return true;
     } catch (error) {
@@ -610,7 +641,21 @@ time: ${endTime - startTime}s`);
    * @example
    * await LanceDBManager.updateRecord('test', { where:'id=1',values:{name:'test1',age:20} });
    */
-  static async updateRecord(tableName, record) {
+  static async updateRecord(tableName, record, logInfo) {
+    const g = global;
+    if (tableName === "doc_table") {
+      if (!g.docUpdateQueue) {
+        g.docUpdateQueue = Promise.resolve();
+      }
+      const prev = g.docUpdateQueue;
+      const next = prev.then(() => this.doUpdateRecord(tableName, record, logInfo));
+      g.docUpdateQueue = next.catch(() => {
+      });
+      return await next;
+    }
+    return await this.doUpdateRecord(tableName, record, logInfo);
+  }
+  static async doUpdateRecord(tableName, record, logInfo) {
     const metrics = this.startMetrics(`\u66F4\u65B0\u6587\u6863\u5230\u8868 ${tableName}`);
     this.ensureDatabaseDirectory();
     const db = await lancedb.connect(import_public.pub.get_db_path());
@@ -618,10 +663,44 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         return false;
       }
-      const tableObj = await db.openTable(tableName);
-      await tableObj.update(record);
-      await tableObj.optimize();
-      import_log.logger.info(`\u6210\u529F\u66F4\u65B0\u6587\u6863\u5230\u8868 ${tableName}`);
+      let tableObj = await db.openTable(tableName);
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          await tableObj.update(record);
+          break;
+        } catch (err) {
+          const msg2 = String(err?.message || err);
+          if (msg2.includes("concurrent commit") || msg2.includes("conflict")) {
+            import_log.logger.warn(`[LanceDB] \u66F4\u65B0\u51B2\u7A81\uFF0C\u7B2C ${attempt} \u6B21\u91CD\u8BD5`, tableName, record);
+            await new Promise((r) => setTimeout(r, 200 + attempt * 200 + Math.floor(Math.random() * 200)));
+            try {
+              await tableObj.close();
+            } catch {
+            }
+            tableObj = await db.openTable(tableName);
+            continue;
+          }
+          throw err;
+        }
+      }
+      let needOptimize = true;
+      if (tableName === "doc_table") {
+        const now = Date.now();
+        const g = global;
+        if (!g.docTableOptimize) {
+          g.docTableOptimize = { last: 0, count: 0 };
+        }
+        g.docTableOptimize.count++;
+        const last = g.docTableOptimize.last || 0;
+        needOptimize = g.docTableOptimize.count % 50 === 0 || now - last > 3e4;
+        if (needOptimize) {
+          g.docTableOptimize.last = now;
+        }
+      }
+      if (needOptimize) {
+      }
+      const msg = logInfo ? `\u6210\u529F\u66F4\u65B0-${logInfo} \u5230\u8868 ${tableName}` : `\u6210\u529F\u66F4\u65B0\u6587\u6863\u5230\u8868 ${tableName}`;
+      import_log.logger.info(msg);
       return true;
     } catch (error) {
       import_log.logger.error(`\u66F4\u65B0\u6587\u6863\u5931\u8D25: ${error.message}`, tableName, record);
@@ -645,7 +724,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         return false;
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       await tableObj.delete(where);
       await tableObj.optimize();
       return true;
@@ -671,7 +750,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         return [];
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       let query = tableObj.query().where(where).limit(1e4);
       if (field.length > 0) {
         query = query.select(field);
@@ -681,6 +760,26 @@ time: ${endTime - startTime}s`);
     } catch (error) {
       import_log.logger.error(`\u67E5\u8BE2\u6587\u6863\u5931\u8D25: ${error.message}`);
       return [];
+    } finally {
+      await db.close();
+      this.endMetrics(metrics);
+    }
+  }
+  static async queryCount(tableName, where) {
+    const metrics = this.startMetrics(`\u67E5\u8BE2\u6587\u6863\u5230\u8868 ${tableName}`);
+    this.ensureDatabaseDirectory();
+    const db = await lancedb.connect(import_public.pub.get_db_path());
+    try {
+      if (!await this.tableExists(db, tableName)) {
+        return 0;
+      }
+      let tableObj = await db.openTable(tableName);
+      let query = tableObj.query().where(where).select(["doc_id"]).limit(1e7);
+      const results = await query.toArray();
+      return results.length;
+    } catch (error) {
+      import_log.logger.error(`\u67E5\u8BE2\u6587\u6863\u5931\u8D25: ${error.message}`);
+      return 0;
     } finally {
       await db.close();
       this.endMetrics(metrics);
@@ -700,7 +799,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         return 0;
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       const results = await tableObj.countRows();
       return results;
     } catch (error) {
@@ -718,29 +817,80 @@ time: ${endTime - startTime}s`);
    * @param texts 文本数组
    * @returns 添加的记录数量
    */
-  static async addDocuments(tableName, supplierName, model, texts, keywords, docId) {
-    if (!texts.length) {
+  static async addDocuments(tableName, supplierName2, model2, texts2, keywords, docId) {
+    if (!texts2.length) {
       return 0;
     }
-    const metrics = this.startMetrics(`\u6279\u91CF\u6DFB\u52A0 ${texts.length} \u6761\u6587\u6863\u5230\u8868 ${tableName}`);
+    const metrics = this.startMetrics(`\u6279\u91CF\u6DFB\u52A0 ${texts2.length} \u6761\u6587\u6863\u5230\u8868 ${tableName}`);
     this.ensureDatabaseDirectory();
-    const db = await lancedb.connect(import_public.pub.get_db_path());
+    let db = await lancedb.connect(import_public.pub.get_db_path());
     try {
       if (!await this.tableExists(db, tableName)) {
-        throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
+        await db.close();
+        try {
+          await this.createTable(tableName, supplierName2, model2, texts2[0]);
+        } catch (err) {
+          const msg = String(err?.message || err);
+          if (!msg.includes("\u5DF2\u5B58\u5728") && !msg.includes("already exists")) {
+            import_log.logger.warn(`[LanceDB] \u81EA\u52A8\u521B\u5EFA\u8868\u9047\u5230\u9519\u8BEF (\u53EF\u80FD\u662F\u5E76\u53D1): ${msg}`);
+          }
+        }
+        db = await lancedb.connect(import_public.pub.get_db_path());
+        if (!await this.tableExists(db, tableName)) {
+          throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728\uFF0C\u4E14\u81EA\u52A8\u521B\u5EFA\u5931\u8D25`);
+        }
       }
-      const tableObj = await db.openTable(tableName);
-      const embeddingPromises = texts.map((text) => this.getEmbedding(supplierName, model, text));
-      const embeddings = await Promise.all(embeddingPromises);
+      let tableObj = await db.openTable(tableName);
+      const limit = 10;
+      const embeddings = [];
+      let idx = 0;
+      while (idx < texts2.length) {
+        await new Promise((r) => setTimeout(r, 50));
+        const batch = texts2.slice(idx, idx + limit);
+        console.log(`[LanceDB] Processing batch ${idx / limit + 1}/${Math.ceil(texts2.length / limit)} (size: ${batch.length})...`);
+        const batchEmb = await Promise.all(batch.map((text) => this.getEmbedding(supplierName2, model2, text)));
+        console.log(`[LanceDB] Batch ${idx / limit + 1} completed.`);
+        embeddings.push(...batchEmb);
+        idx += limit;
+      }
       const records = embeddings.map((embedding, index) => ({
         id: import_public.pub.uuid(),
-        doc: texts[index],
+        doc: texts2[index],
         docId,
         keywords: keywords[index],
         vector: embedding
       }));
-      await tableObj.add(records);
-      await tableObj.optimize();
+      let added = false;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          await tableObj.add(records);
+          added = true;
+          break;
+        } catch (err) {
+          const msg = String(err?.message || err);
+          if (msg.includes("Commit conflict") || msg.includes("concurrent commit")) {
+            await new Promise((r) => setTimeout(r, 300 + attempt * 300));
+            await tableObj.close();
+            tableObj = await db.openTable(tableName);
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (!added) {
+        throw new Error("\u6279\u91CF\u6DFB\u52A0\u6587\u6863\u5931\u8D25: \u63D0\u4EA4\u51B2\u7A81\u91CD\u8BD5\u8D85\u9650");
+      }
+      if (!global.vectorOptimize) {
+        global.vectorOptimize = {};
+      }
+      const info = global.vectorOptimize[tableName] || { last: 0, count: 0 };
+      const now = Date.now();
+      info.count++;
+      const needOptimize = info.count % 10 === 0 || now - info.last > 3e4;
+      if (needOptimize) {
+        info.last = now;
+      }
+      global.vectorOptimize[tableName] = info;
       return records.length;
     } catch (error) {
       throw new Error(`\u6279\u91CF\u6DFB\u52A0\u6587\u6863\u5931\u8D25: ${error.message}`);
@@ -757,7 +907,7 @@ time: ${endTime - startTime}s`);
    * @param limit 结果数量限制
    * @returns 查询结果
    */
-  static async search(tableName, supplierName, model, queryText, limit = 5) {
+  static async search(tableName, supplierName2, model2, queryText, limit = 5) {
     const metrics = this.startMetrics(`\u5728\u8868 ${tableName} \u4E2D\u641C\u7D22`);
     this.ensureDatabaseDirectory();
     const db = await lancedb.connect(import_public.pub.get_db_path());
@@ -765,8 +915,8 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
       }
-      const tableObj = await db.openTable(tableName);
-      const embedding = await this.getEmbedding(supplierName, model, queryText);
+      let tableObj = await db.openTable(tableName);
+      const embedding = await this.getEmbedding(supplierName2, model2, queryText);
       const results = await tableObj.search(embedding).limit(limit).select(["id", "doc", "_distance"]).toArray();
       return results.map((item) => ({
         id: item.id,
@@ -787,7 +937,7 @@ time: ${endTime - startTime}s`);
     const metrics = this.startMetrics(`\u5728\u8868 ${tableName} \u4E2D\u6267\u884C\u6DF7\u5408\u641C\u7D22`);
     this.ensureDatabaseDirectory();
     const db = await lancedb.connect(import_public.pub.get_db_path());
-    const tableObj = await db.openTable(tableName);
+    let tableObj = await db.openTable(tableName);
     const embedding = await this.getEmbedding(ragInfo.supplierName, ragInfo.embeddingModel, queryText);
     let isTokensIdx = await tableObj.indexStats("tokens_idx");
     if (!isTokensIdx) {
@@ -828,7 +978,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         return [];
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       await this.preWarmQuery(tableObj);
       const resultMap = /* @__PURE__ */ new Map();
       const searchPromises = [];
@@ -1132,7 +1282,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       const results = await tableObj.query().select(["id", "doc"]).toArray();
       return results.map((item) => ({
         id: item.id,
@@ -1157,7 +1307,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       return await tableObj.countRows();
     } catch (error) {
       throw new Error(`\u83B7\u53D6\u8BB0\u5F55\u6570\u91CF\u5931\u8D25: ${error.message}`);
@@ -1223,7 +1373,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       const where = "`docId` = '" + docId + "'";
       const exists = (await tableObj.query().where(where).select(["docId"]).limit(1).toArray()).length > 0;
       if (!exists) {
@@ -1292,7 +1442,7 @@ time: ${endTime - startTime}s`);
       if (!await this.tableExists(db, tableName)) {
         throw new Error(`\u8868 "${tableName}" \u4E0D\u5B58\u5728`);
       }
-      const tableObj = await db.openTable(tableName);
+      let tableObj = await db.openTable(tableName);
       const processedKeywords = caseSensitive ? keywords : keywords.map((k) => k.toLowerCase());
       let whereClause = "";
       switch (matchMode) {

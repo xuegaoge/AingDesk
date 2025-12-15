@@ -415,7 +415,8 @@ class ToChatService {
       search_result: [],
       search_type: search,
       search_query: "",
-      tools_result: []
+      tools_result: [],
+      mcp_progress: []
     };
     await chatService.save_chat_history(uuid, chatHistory, chatHistoryRes, modelInfo.contextLength, regenerate_id);
     await chatService.update_chat_config(uuid, "search_type", search);
@@ -480,6 +481,15 @@ class ToChatService {
         requestOption.temperature = 0.6;
       }
     }
+    if (!mcp_servers || mcp_servers.length === 0) {
+      try {
+        const activeServers = await import_mcp_client.MCPClient.getActiveServers();
+        if (activeServers && activeServers.length > 0) {
+          mcp_servers = activeServers.map((s2) => s2.name);
+        }
+      } catch (e) {
+      }
+    }
     if (mcp_servers.length > 0) {
       isOllama = false;
     }
@@ -491,9 +501,19 @@ class ToChatService {
       }
     });
     const PushOther = async (msg) => {
-      if (msg) {
-        s.push(msg);
-        if (msg.indexOf("<mcptool>") !== -1) {
+      if (!msg) return;
+      s.push(msg);
+      if (msg.indexOf("<mcptool>") !== -1) {
+        try {
+          const jsonStr = msg.replace(/<mcptool>|<\/mcptool>/g, "").trim();
+          const obj = JSON.parse(jsonStr);
+          if (obj && obj.type === "progress") {
+            if (!Array.isArray(chatHistoryRes.mcp_progress)) chatHistoryRes.mcp_progress = [];
+            chatHistoryRes.mcp_progress.push(obj);
+          } else {
+            chatHistoryRes.tools_result.push(msg);
+          }
+        } catch (e) {
           chatHistoryRes.tools_result.push(msg);
         }
       }
@@ -508,7 +528,7 @@ class ToChatService {
       if (chunk.choices && chunk.choices.length === 0) {
         return;
       }
-      if (isOllama && chunk.done || !isOllama && (chunk.choices[0].finish_reason === "stop" || chunk.choices[0].finish_reason === "normal")) {
+      if (isOllama && chunk.done || !isOllama && ["stop", "normal", "length", "content_filter"].includes(chunk.choices[0]?.finish_reason)) {
         const resInfo = getResponseInfo(chunk, isOllama, modelStr, resTimeMs);
         chatHistoryRes.created_at = chunk.created_at ? chunk.created_at.toString() : chunk.created;
         chatHistoryRes.create_time = chunk.created ? chunk.created : import_public.pub.time();

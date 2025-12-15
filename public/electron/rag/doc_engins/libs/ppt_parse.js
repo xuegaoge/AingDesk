@@ -33,6 +33,7 @@ __export(ppt_parse_exports, {
 module.exports = __toCommonJS(ppt_parse_exports);
 var fs = __toESM(require("fs/promises"));
 var path = __toESM(require("path"));
+var import_child_process = require("child_process");
 class PptxParser {
   // 读取PPT文件，按格式提取文本和图片，返回Markdown格式的字符串
   async ppt2md(filename) {
@@ -110,27 +111,78 @@ ${item.content}`;
     }).join("\n\n");
   }
 }
-async function parse(filename) {
-  try {
-    const ext = path.extname(filename).toLowerCase();
-    if (ext === ".pptx") {
-      const parser = new PptxParser();
-      return await parser.ppt2md(filename);
-    } else if (ext === ".ppt") {
-      return `# \u4E0D\u652F\u6301\u7684\u6587\u4EF6\u683C\u5F0F
+async function parse(filename, ragName) {
+  let scriptPath = __filename;
+  if (path.extname(scriptPath) === ".ts") {
+    scriptPath = path.join(process.cwd(), "public", "electron", "rag", "doc_engins", "libs", "ppt_parse.js");
+  }
+  return new Promise((resolve, reject) => {
+    const child = (0, import_child_process.spawn)(process.execPath, [scriptPath, filename, ragName], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }
+    });
+    let stdoutData = "";
+    let stderrData = "";
+    child.stdout.on("data", (data) => {
+      stdoutData += data.toString();
+    });
+    child.stderr.on("data", (data) => {
+      stderrData += data.toString();
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        console.error(`[PptParse] Process exited with code ${code}`);
+        console.error(`[PptParse] Stderr: ${stderrData}`);
+        resolve("");
+        return;
+      }
+      try {
+        const result = JSON.parse(stdoutData);
+        if (result.success) {
+          resolve(result.data);
+        } else {
+          console.error(`[PptParse] Worker reported error: ${result.error}`);
+          resolve("");
+        }
+      } catch (error) {
+        console.error(`[PptParse] Failed to parse worker output: ${stdoutData}`);
+        resolve("");
+      }
+    });
+    child.on("error", (error) => {
+      console.error(`[PptParse] Failed to spawn worker: ${error}`);
+      resolve("");
+    });
+  });
+}
+if (require.main === module) {
+  (async () => {
+    const filename = process.argv[2];
+    const ragName = process.argv[3];
+    if (!filename) {
+      console.error("Usage: node ppt_parse.js <filename> [ragName]");
+      process.exit(1);
+    }
+    try {
+      const ext = path.extname(filename).toLowerCase();
+      let result = "";
+      if (ext === ".pptx") {
+        const parser = new PptxParser();
+        result = await parser.ppt2md(filename);
+      } else if (ext === ".ppt") {
+        result = `# \u4E0D\u652F\u6301\u7684\u6587\u4EF6\u683C\u5F0F
 
 \u5F88\u62B1\u6B49\uFF0C\u76EE\u524D\u4EC5\u652F\u6301.pptx\u683C\u5F0F\u7684PowerPoint\u6587\u4EF6\u89E3\u6790\u3002`;
-    } else {
-      return `# \u4E0D\u652F\u6301\u7684\u6587\u4EF6\u683C\u5F0F
+      } else {
+        result = `# \u4E0D\u652F\u6301\u7684\u6587\u4EF6\u683C\u5F0F
 
 \u6587\u4EF6 ${path.basename(filename)} \u4E0D\u662F\u6709\u6548\u7684PowerPoint\u6587\u4EF6\u3002`;
+      }
+      process.stdout.write(JSON.stringify({ success: true, data: result }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ success: false, error: error.message || "\u672A\u77E5\u9519\u8BEF" }));
     }
-  } catch (error) {
-    console.error("\u89E3\u6790PPT\u6587\u4EF6\u5931\u8D25:", error);
-    return `# PPT\u89E3\u6790\u5931\u8D25
-
-\u65E0\u6CD5\u89E3\u6790PowerPoint\u6587\u4EF6\u3002\u9519\u8BEF: ${error.message || "\u672A\u77E5\u9519\u8BEF"}`;
-  }
+  })();
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {

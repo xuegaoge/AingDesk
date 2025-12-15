@@ -328,6 +328,121 @@ class RagController {
     return import_public.pub.return_success(import_public.pub.lang("\u6587\u4EF6\u4E0A\u4F20\u6210\u529F"));
   }
   /**
+   * 递归扫描文件
+   */
+  scanFiles(dir, fileList = []) {
+    const files = fs.readdirSync(dir);
+    const SUPPORTED_EXTS = [
+      ".docx",
+      ".doc",
+      ".xlsx",
+      ".xls",
+      ".csv",
+      ".pptx",
+      ".ppt",
+      ".pdf",
+      ".html",
+      ".htm",
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".bmp",
+      ".webp",
+      ".md",
+      ".markdown",
+      ".txt",
+      ".log",
+      ".text",
+      ".conf",
+      ".cfg",
+      ".ini",
+      ".json"
+    ];
+    files.forEach((file) => {
+      const filePath = path.join(dir, file);
+      const stat = fs.statSync(filePath);
+      if (stat.isDirectory()) {
+        this.scanFiles(filePath, fileList);
+      } else {
+        if (SUPPORTED_EXTS.includes(path.extname(file).toLowerCase())) {
+          fileList.push(filePath);
+        }
+      }
+    });
+    return fileList;
+  }
+  /**
+   * 导入文件夹（服务端扫描模式）
+   * @param {string} ragName - 知识库名称
+   * @param {string} folderPath - 文件夹路径
+   * @returns {Promise<any>}
+   */
+  async import_folder(args) {
+    let { ragName, folderPath, separators, chunkSize, overlapSize } = args;
+    if (!ragName) return import_public.pub.return_error(import_public.pub.lang("\u77E5\u8BC6\u5E93\u540D\u79F0\u4E0D\u80FD\u4E3A\u7A7A"));
+    if (ragName == "vector_db") return import_public.pub.return_error(import_public.pub.lang("\u77E5\u8BC6\u5E93\u540D\u79F0\u4E0D\u80FD\u4E3Avector_db"));
+    if (!folderPath) return import_public.pub.return_error(import_public.pub.lang("\u6587\u4EF6\u5939\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A"));
+    if (!import_public.pub.file_exists(folderPath)) return import_public.pub.return_error(import_public.pub.lang("\u6587\u4EF6\u5939\u4E0D\u5B58\u5728"));
+    if (!separators) separators = [];
+    if (!chunkSize) chunkSize = 1e3;
+    if (!overlapSize) overlapSize = 100;
+    if (typeof separators == "string") separators = [separators];
+    const ragPath = import_public.pub.get_rag_path() + "/" + ragName;
+    if (!import_public.pub.file_exists(ragPath)) return import_public.pub.return_error(import_public.pub.lang("\u77E5\u8BC6\u5E93\u4E0D\u5B58\u5728"));
+    const ragDescFile = ragPath + "/config.json";
+    if (import_public.pub.file_exists(ragDescFile)) {
+      let ragConfig = import_public.pub.read_json(ragDescFile);
+      ragConfig.separators = separators;
+      ragConfig.chunkSize = chunkSize;
+      ragConfig.overlapSize = overlapSize;
+      import_public.pub.write_json(ragDescFile, ragConfig);
+    }
+    let files = [];
+    try {
+      files = this.scanFiles(folderPath);
+    } catch (e) {
+      return import_public.pub.return_error(import_public.pub.lang("\u626B\u63CF\u6587\u4EF6\u5939\u5931\u8D25: {}", e.message));
+    }
+    if (files.length === 0) {
+      return import_public.pub.return_error(import_public.pub.lang("\u8BE5\u6587\u4EF6\u5939\u4E0B\u6CA1\u6709\u652F\u6301\u7684\u6587\u4EF6"));
+    }
+    const ragObj = new import_rag.Rag();
+    const batchSize = 50;
+    let successCount = 0;
+    let dbInsertList = [];
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, i + batchSize);
+      await Promise.all(batch.map(async (srcFile) => {
+        try {
+          const fileName = path.basename(srcFile);
+          const ext = path.extname(srcFile);
+          const nameNoExt = path.basename(srcFile, ext);
+          const safeFileName = `${import_public.pub.uuid()}${ext}`;
+          const dstFile = path.join(ragPath, "source", safeFileName);
+          await fs.promises.copyFile(srcFile, dstFile);
+          dbInsertList.push({
+            filename: srcFile,
+            // 原始路径，用于提取 doc_name
+            dstFile
+            // 实际存储路径
+          });
+          successCount++;
+        } catch (e) {
+          console.error(`Copy file error: ${srcFile}`, e);
+        }
+      }));
+    }
+    if (dbInsertList.length > 0) {
+      const dbBatchSize = 500;
+      for (let i = 0; i < dbInsertList.length; i += dbBatchSize) {
+        const batch = dbInsertList.slice(i, i + dbBatchSize);
+        await ragObj.addDocumentsToDB(batch, ragName, separators, chunkSize, overlapSize);
+      }
+    }
+    return import_public.pub.return_success(import_public.pub.lang("\u6210\u529F\u5BFC\u5165 {} \u4E2A\u6587\u4EF6\u5230\u5904\u7406\u961F\u5217", successCount));
+  }
+  /**
    * 获取知识库文档列表
    * @param {string} ragName - 知识库名称
    * @returns {Promise<any>} - 文件列表
@@ -577,6 +692,19 @@ class RagController {
     let ragObj = new import_rag.Rag();
     let result = await ragObj.getDocChunkList(args.ragName, args.docId);
     return import_public.pub.return_success(import_public.pub.lang("\u64CD\u4F5C\u6210\u529F"), result);
+  }
+  /**
+   * 清除未完成的任务队列
+   * @returns {Promise<any>}
+   */
+  async clear_queue() {
+    let ragTask = new import_rag_task.RagTask();
+    let result = await ragTask.clearTaskQueue();
+    if (result) {
+      return import_public.pub.return_success(import_public.pub.lang("\u4EFB\u52A1\u961F\u5217\u5DF2\u6E05\u9664"));
+    } else {
+      return import_public.pub.return_error(import_public.pub.lang("\u6E05\u9664\u4EFB\u52A1\u961F\u5217\u5931\u8D25"));
+    }
   }
 }
 RagController.toString = () => "[class RagController]";

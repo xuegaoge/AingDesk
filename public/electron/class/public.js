@@ -267,9 +267,12 @@ class Public {
         }
       }
     }
-    let data_path = path.resolve(this.get_root_path(), "data");
+    let data_path = path.resolve(this.get_user_data_path(), "data");
     if (!fs.existsSync(data_path)) {
-      data_path = path.resolve(this.get_user_data_path(), "data");
+      fs.mkdirSync(data_path);
+    }
+    if (!fs.existsSync(data_path)) {
+      data_path = path.resolve(this.get_root_path(), "data");
       if (!fs.existsSync(data_path)) {
         fs.mkdirSync(data_path);
       }

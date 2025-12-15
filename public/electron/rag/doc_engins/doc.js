@@ -149,6 +149,7 @@ class DocumentParser {
    * @returns 解析结果
    */
   static async parseDocument(filename, ragName) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
     try {
       const extension = this.getFileExtension(filename);
       if (extension != "http") {
@@ -193,16 +194,22 @@ class DocumentParser {
    * @param filename 原始文件路径
    * @param content 解析内容
    * @param ragName 知识库名称
+   * @param customOutputFilename 自定义输出文件名（不含扩展名）
    * @returns 保存的文件路径
    */
-  static async saveToFile(filename, content, ragName) {
+  static async saveToFile(filename, content, ragName, customOutputFilename) {
     try {
       const outputDir = path.join((0, import_utils.get_doc_save_path)(), ragName, "markdown");
       if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
       }
-      const basename = path.basename(filename);
-      const outputFilename = `${basename}.md`;
+      let outputFilename;
+      if (customOutputFilename) {
+        outputFilename = customOutputFilename.endsWith(".md") ? customOutputFilename : `${customOutputFilename}.md`;
+      } else {
+        const basename = path.basename(filename);
+        outputFilename = `${basename}.md`;
+      }
       const outputPath = path.join(outputDir, outputFilename);
       await fs.promises.writeFile(outputPath, content, "utf-8");
       console.log(`\u89E3\u6790\u7ED3\u679C\u5DF2\u4FDD\u5B58\u81F3: ${outputPath}`);
@@ -215,12 +222,12 @@ class DocumentParser {
     }
   }
 }
-async function parseDocument(filename, ragName = "", saveToFile = false) {
+async function parseDocument(filename, ragName = "", saveToFile = false, customOutputFilename) {
   try {
     const result = await DocumentParser.parseDocument(filename, ragName);
     let savedPath;
     if (saveToFile && result.success && ragName) {
-      const saveResult = await DocumentParser.saveToFile(filename, result.content, ragName);
+      const saveResult = await DocumentParser.saveToFile(filename, result.content, ragName, customOutputFilename);
       savedPath = saveResult.parsedPath;
     }
     return {

@@ -34,6 +34,7 @@ module.exports = __toCommonJS(docx_parse_exports);
 var import_fs = __toESM(require("fs"));
 var import_path = __toESM(require("path"));
 var import_pizzip = __toESM(require("pizzip"));
+var import_child_process = require("child_process");
 var import_utils = require("../utils");
 var import_public = require("../../../class/public");
 class DocxParser {
@@ -43,14 +44,16 @@ class DocxParser {
   zip = null;
   documentContent = [];
   imageIndex = 0;
+  outputDir = null;
   /**
    * 构造函数
    * @param filename 要解析的文件路径
    */
-  constructor(filename, ragName) {
+  constructor(filename, ragName, outputDir) {
     this.filename = filename;
     this.ragName = ragName;
     this.baseDocName = import_path.default.basename(filename, import_path.default.extname(filename));
+    if (outputDir) this.outputDir = outputDir;
   }
   /**
    * 初始化PizZip对象
@@ -74,7 +77,7 @@ class DocxParser {
    */
   saveImage(imageData, imageName) {
     try {
-      const outputDir = (0, import_utils.get_image_save_path)();
+      const outputDir = this.outputDir || (0, import_utils.get_image_save_path)();
       if (!import_fs.default.existsSync(outputDir)) {
         import_fs.default.mkdirSync(outputDir, { recursive: true });
       }
@@ -196,15 +199,68 @@ class DocxParser {
   }
 }
 async function parse(filename, ragName) {
-  try {
-    const parser = new DocxParser(filename, ragName);
-    const result = await parser.parse();
-    parser.dispose();
-    return result.plainText;
-  } catch (error) {
-    console.error("\u89E3\u6790\u6587\u6863\u5931\u8D25:", error);
-    return "";
+  let scriptPath = __filename;
+  if (import_path.default.extname(scriptPath) === ".ts") {
+    scriptPath = import_path.default.join(process.cwd(), "public", "electron", "rag", "doc_engins", "libs", "docx_parse.js");
   }
+  const outputDir = (0, import_utils.get_image_save_path)();
+  return new Promise((resolve, reject) => {
+    const child = (0, import_child_process.spawn)(process.execPath, [scriptPath, filename, ragName, outputDir], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }
+    });
+    let stdoutData = "";
+    let stderrData = "";
+    child.stdout.on("data", (data) => {
+      stdoutData += data.toString();
+    });
+    child.stderr.on("data", (data) => {
+      stderrData += data.toString();
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        console.error(`[DocxParse] Process exited with code ${code}`);
+        console.error(`[DocxParse] Stderr: ${stderrData}`);
+        resolve("");
+        return;
+      }
+      try {
+        const result = JSON.parse(stdoutData);
+        if (result.success) {
+          resolve(result.data);
+        } else {
+          console.error(`[DocxParse] Worker reported error: ${result.error}`);
+          resolve("");
+        }
+      } catch (error) {
+        console.error(`[DocxParse] Failed to parse worker output: ${stdoutData}`);
+        resolve("");
+      }
+    });
+    child.on("error", (error) => {
+      console.error(`[DocxParse] Failed to spawn worker: ${error}`);
+      resolve("");
+    });
+  });
+}
+if (require.main === module) {
+  (async () => {
+    const filename = process.argv[2];
+    const ragName = process.argv[3];
+    const outputDir = process.argv[4];
+    if (!filename || !ragName) {
+      console.error("Usage: node docx_parse.js <filename> <ragName> [outputDir]");
+      process.exit(1);
+    }
+    try {
+      const parser = new DocxParser(filename, ragName, outputDir);
+      const result = await parser.parse();
+      parser.dispose();
+      process.stdout.write(JSON.stringify({ success: true, data: result.plainText }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ success: false, error: error.message || "\u672A\u77E5\u9519\u8BEF" }));
+    }
+  })();
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
