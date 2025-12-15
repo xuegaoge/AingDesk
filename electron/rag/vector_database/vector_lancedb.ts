@@ -242,6 +242,7 @@ export class LanceDBManager {
      */
     private static async getEmbedding(supplierName:string,model: string, text: string): Promise<number[]> {
         const metrics = this.startMetrics(`生成嵌入 (${text.substring(0, 30)}...)`);
+        console.log(`[LanceDB] getEmbedding started for: ${text.substring(0, 30)}... (Supplier: ${supplierName}, Model: ${model})`);
 
         let key = pub.md5(`${supplierName}-${model}-${text}`);
         // 检查缓存
@@ -286,6 +287,7 @@ export class LanceDBManager {
                     }
                     
                     // 成功获取嵌入，跳出重试循环
+                    console.log(`[LanceDB] Successfully retrieved embedding. Dimensions: ${res.embedding.length}`);
                     break;
                 } catch (err) {
                     lastError = err;
@@ -293,13 +295,16 @@ export class LanceDBManager {
                         logger.warn(`[LanceDB] 获取嵌入失败，正在重试 (${attempt}/5): ${err.message}`);
                         await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
                     } else {
+                        logger.error(`[LanceDB] getEmbedding failed for: ${text.substring(0, 30)}... (Supplier: ${supplierName}, Model: ${model}): ${err.message}`);
                         throw err;
                     }
                 }
             }
 
             // 设置缓存
+            console.log(`[LanceDB] Setting embedding cache for key: ${key}...`);
             await this.setEmbeddingCache(key,res.embedding);
+            console.log(`[LanceDB] Cache set successfully.`);
 
             return res.embedding;
         } catch (error: any) {
@@ -750,12 +755,29 @@ export class LanceDBManager {
         const metrics = this.startMetrics(`添加文档到表 ${tableName}`);
         this.ensureDatabaseDirectory();
 
-        const db = await lancedb.connect(pub.get_db_path());
+        let db = await lancedb.connect(pub.get_db_path());
 
         try {
             // 检查表是否存在
             if (!(await this.tableExists(db, tableName))) {
-                throw new Error(`表 "${tableName}" 不存在`);
+                // 关闭当前连接，尝试创建表
+                await db.close();
+                try {
+                    await this.createTable(tableName, supplierName, model, texts[0]);
+                } catch (err: any) {
+                    // 忽略表已存在的错误（处理并发情况）
+                    const msg = String(err?.message || err);
+                    if (!msg.includes('已存在')) {
+                        logger.warn(`[LanceDB] 自动创建表遇到错误 (可能是并发): ${msg}`);
+                    }
+                }
+                // 重新连接
+                db = await lancedb.connect(pub.get_db_path());
+                
+                // 再次检查
+                if (!(await this.tableExists(db, tableName))) {
+                    throw new Error(`表 "${tableName}" 不存在，且自动创建失败`);
+                }
             }
 
             let tableObj = await db.openTable(tableName);
@@ -998,25 +1020,44 @@ export class LanceDBManager {
         const metrics = this.startMetrics(`批量添加 ${texts.length} 条文档到表 ${tableName}`);
         this.ensureDatabaseDirectory();
 
-        const db = await lancedb.connect(pub.get_db_path());
+        let db = await lancedb.connect(pub.get_db_path());
 
         try {
             // 检查表是否存在
             if (!(await this.tableExists(db, tableName))) {
-                throw new Error(`表 "${tableName}" 不存在`);
+                // 关闭当前连接，尝试创建表
+                await db.close();
+                try {
+                    await this.createTable(tableName, supplierName, model, texts[0]);
+                } catch (err: any) {
+                    // 忽略表已存在的错误（处理并发情况）
+                    const msg = String(err?.message || err);
+                    if (!msg.includes('已存在') && !msg.includes('already exists')) {
+                        logger.warn(`[LanceDB] 自动创建表遇到错误 (可能是并发): ${msg}`);
+                    }
+                }
+                // 重新连接
+                db = await lancedb.connect(pub.get_db_path());
+                
+                // 再次检查
+                if (!(await this.tableExists(db, tableName))) {
+                    throw new Error(`表 "${tableName}" 不存在，且自动创建失败`);
+                }
             }
 
             let tableObj = await db.openTable(tableName);
 
             // 受限并发处理嵌入生成，避免 CPU 饱和
-            const limit = 8;
+            const limit = 10;
             const embeddings: number[] [] = [] as any;
             let idx = 0;
             while (idx < texts.length) {
                 // 给主线程喘息机会
                 await new Promise(r => setTimeout(r, 50));
                 const batch = texts.slice(idx, idx + limit);
+                console.log(`[LanceDB] Processing batch ${idx/limit + 1}/${Math.ceil(texts.length/limit)} (size: ${batch.length})...`);
                 const batchEmb = await Promise.all(batch.map(text => this.getEmbedding(supplierName,model, text)));
+                console.log(`[LanceDB] Batch ${idx/limit + 1} completed.`);
                 embeddings.push(...batchEmb);
                 idx += limit;
             }

@@ -73,13 +73,16 @@ export class ModelService {
             return [];
         }
         try {
+            console.log(`[ModelService] calling embedding for model ${model}...`);
             const res:any = await this.client!.embeddings.create({
                 model,
                 input,
                 encoding_format: "float"
             });
+            console.log(`[ModelService] embedding success.`);
             return res.data[0] || [];
         } catch (error) {
+            console.error(`[ModelService] embedding error:`, error);
             this.error = error;
             return [];
         }
@@ -237,9 +240,11 @@ export class ModelService {
             return false;
         }
         try {
+            console.log(`[ModelService] connecting to ${this.baseUrl} with timeout 60000ms`);
             this.client = new OpenAI({
                 apiKey: this.apiKey,
                 baseURL: this.baseUrl,
+                timeout: 60000
             });
             return true;
         } catch (error) {

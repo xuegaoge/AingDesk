@@ -1,5 +1,6 @@
 import * as XLSX from 'xlsx';
 import * as path from 'path';
+import { spawn } from 'child_process';
 
 // 类型定义
 interface SheetData {
@@ -259,14 +260,77 @@ export class ExcelParser {
  * @param ragName 名称
  * @returns Markdown 格式的字符串
  */
-export async function parse(filename: string,ragName:string): Promise<string> {
-  try {
-    const parser = new ExcelParser(filename,ragName);
-    const markdown = await parser.parse();
-    parser.dispose(); // 释放资源
-    return markdown;
-  } catch (error: any) {
-    console.error('解析 Excel 文件失败:', error);
-    return `# Excel解析失败\n\n无法解析Excel文件。错误: ${error.message || '未知错误'}`;
-  }
+export async function parse(filename: string, ragName: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // 开启子进程进行解析，避免阻塞主线程
+    let scriptPath = __filename;
+    if (path.extname(scriptPath) === '.ts') {
+        // Dev environment: map .ts source to compiled .js in public/electron
+        scriptPath = path.join(process.cwd(), 'public', 'electron', 'rag', 'doc_engins', 'libs', 'xls_parse.js');
+    }
+    
+    const child = spawn(process.execPath, [scriptPath, filename, ragName], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`[XlsParse] Worker exited with code ${code}: ${stderr}`);
+        resolve(`# 解析失败\n\nExcel解析进程异常退出 (Code ${code})`);
+        return;
+      }
+
+      try {
+        const result = JSON.parse(stdout.trim());
+        if (result.success) {
+          resolve(result.data);
+        } else {
+          resolve(`# 解析失败\n\n${result.error}`);
+        }
+      } catch (error: any) {
+        console.error(`[XlsParse] Failed to parse worker output: ${stdout}`);
+        resolve(`# 解析失败\n\n解析结果格式错误: ${error.message}`);
+      }
+    });
+
+    child.on('error', (error) => {
+      console.error(`[XlsParse] Failed to spawn worker: ${error}`);
+      resolve(`# 解析失败\n\n无法启动解析进程: ${error.message}`);
+    });
+  });
+}
+
+// Worker Entry Point
+if (require.main === module) {
+  (async () => {
+    const filename = process.argv[2];
+    const ragName = process.argv[3];
+
+    if (!filename || !ragName) {
+      console.error('Usage: node xls_parse.js <filename> <ragName>');
+      process.exit(1);
+    }
+
+    try {
+      const parser = new ExcelParser(filename, ragName);
+      // @ts-ignore - access private/public method if needed, but parse is public in class
+      const markdown = await parser.parse();
+      parser.dispose();
+      process.stdout.write(JSON.stringify({ success: true, data: markdown }));
+    } catch (error: any) {
+      process.stdout.write(JSON.stringify({ success: false, error: error.message || '未知错误' }));
+    }
+  })();
 }

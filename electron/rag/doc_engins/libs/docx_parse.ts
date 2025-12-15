@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import PizZip from 'pizzip';
+import { spawn } from 'child_process';
 import { get_image_save_path, IMAGE_URL_LAST } from '../utils';
 import { pub } from '../../../class/public';
 
@@ -33,15 +34,17 @@ export class DocxParser {
   private zip: PizZip | null = null;
   private documentContent: DocumentItem[] = [];
   private imageIndex: number = 0;
+  private outputDir: string | null = null;
 
   /**
    * 构造函数
    * @param filename 要解析的文件路径
    */
-  constructor(filename: string, ragName: string) {
+  constructor(filename: string, ragName: string, outputDir?: string) {
     this.filename = filename;
     this.ragName = ragName;
     this.baseDocName = path.basename(filename, path.extname(filename));
+    if (outputDir) this.outputDir = outputDir;
   }
 
   /**
@@ -68,7 +71,7 @@ export class DocxParser {
   private saveImage(imageData: Uint8Array, imageName: string): { path: string; url: string } {
     try{
       // 创建图片保存目录
-      const outputDir = get_image_save_path();
+      const outputDir = this.outputDir || get_image_save_path();
       if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
       }
@@ -240,13 +243,79 @@ export class DocxParser {
  * @returns 解析后的文本
  */
 export async function parse(filename: string, ragName: string): Promise<string> {
-  try {
-    const parser = new DocxParser(filename, ragName);
-    const result = await parser.parse();
-    parser.dispose(); // 释放资源
-    return result.plainText;
-  } catch (error) {
-    console.error('解析文档失败:', error);
-    return '';
+  let scriptPath = __filename;
+  if (path.extname(scriptPath) === '.ts') {
+      // 开发环境：指向编译后的 JS 文件
+      scriptPath = path.join(process.cwd(), 'public', 'electron', 'rag', 'doc_engins', 'libs', 'docx_parse.js');
   }
+
+  // 获取图片保存路径，传递给子进程
+  const outputDir = get_image_save_path();
+
+  return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [scriptPath, filename, ragName, outputDir], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+      });
+
+      let stdoutData = '';
+      let stderrData = '';
+
+      child.stdout.on('data', (data) => {
+          stdoutData += data.toString();
+      });
+
+      child.stderr.on('data', (data) => {
+          stderrData += data.toString();
+      });
+
+      child.on('close', (code) => {
+          if (code !== 0) {
+              console.error(`[DocxParse] Process exited with code ${code}`);
+              console.error(`[DocxParse] Stderr: ${stderrData}`);
+              resolve(''); // 失败返回空字符串，避免抛出异常中断流程
+              return;
+          }
+
+          try {
+              const result = JSON.parse(stdoutData);
+              if (result.success) {
+                  resolve(result.data);
+              } else {
+                  console.error(`[DocxParse] Worker reported error: ${result.error}`);
+                  resolve('');
+              }
+          } catch (error: any) {
+              console.error(`[DocxParse] Failed to parse worker output: ${stdoutData}`);
+              resolve('');
+          }
+      });
+
+      child.on('error', (error) => {
+          console.error(`[DocxParse] Failed to spawn worker: ${error}`);
+          resolve('');
+      });
+  });
+}
+
+if (require.main === module) {
+  (async () => {
+      const filename = process.argv[2];
+      const ragName = process.argv[3];
+      const outputDir = process.argv[4];
+
+      if (!filename || !ragName) {
+          console.error('Usage: node docx_parse.js <filename> <ragName> [outputDir]');
+          process.exit(1);
+      }
+
+      try {
+          const parser = new DocxParser(filename, ragName, outputDir);
+          const result = await parser.parse();
+          parser.dispose();
+          process.stdout.write(JSON.stringify({ success: true, data: result.plainText }));
+      } catch (error: any) {
+          process.stdout.write(JSON.stringify({ success: false, error: error.message || '未知错误' }));
+      }
+  })();
 }

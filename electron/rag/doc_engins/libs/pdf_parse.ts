@@ -4,7 +4,7 @@ import { pub } from '../../../class/public';
 import { logger } from 'ee-core/log';
 import axios from 'axios';
 import { exec } from 'child_process';
-import { initializeWorker,postProcessText,filterLowConfidenceLines,CONFIDENCE_THRESHOLD } from './image_parse';  // 这里引入了image_parse.ts中的函数，用于识别图片内容
+import { initializeWorker, postProcessText, filterLowConfidenceLines, CONFIDENCE_THRESHOLD } from './image_parse';  // 这里引入了image_parse.ts中的函数，用于识别图片内容
 // import * as pdfjsLib from 'pdfjs-dist';
 
 
@@ -231,7 +231,7 @@ export class PdfParser {
     }
 
     get_poppler_bin() {
-        
+
         if (pub.is_windows()) {
             let binPath = this.get_poppler_path();
             return path.resolve(binPath, 'pdfimages.exe');
@@ -244,59 +244,77 @@ export class PdfParser {
     public async pdf2Image(): Promise<string> {
         let popplerBin = this.get_poppler_bin();
         if (!pub.file_exists(popplerBin)) {
-            if(!pub.is_windows()) {
+            if (!pub.is_windows()) {
                 // 如果不是windows系统，不自动安装，直接返回
+                logger.warn(`[PdfParser] Poppler not found on non-Windows. OCR unavailable: ${popplerBin}`);
                 return '';
             }
+            logger.info(`[PdfParser] Poppler not found, installing: ${popplerBin}`);
             await this.install_poppler();
         }
-        if(!pub.file_exists(popplerBin)) {
-            console.log('popplerBin', popplerBin)
-            return ''
+        if (!pub.file_exists(popplerBin)) {
+            logger.error(`[PdfParser] Poppler still not found after install: ${popplerBin}`);
+            return '';
         }
 
         // 执行命令
-        let imageTmpPath = path.resolve(pub.get_user_data_path(), 'tmp', 'pdf2image',pub.md5(this.filename));
+        let imageTmpPath = path.resolve(pub.get_user_data_path(), 'tmp', 'pdf2image', pub.md5(this.filename));
         if (!pub.file_exists(imageTmpPath)) {
             pub.mkdir(imageTmpPath);
         }
-        let command = `${popplerBin} ${this.filename} ${imageTmpPath}/tmp`;
+        // 添加 -png 参数指定输出格式，用引号包裹路径处理空格
+        let command = `"${popplerBin}" -png "${this.filename}" "${imageTmpPath}/img"`;
         let result = '';
 
-        // 使用exec执行命令防止主进程阻塞，同时等待命令执行完成，以便获取输出
-        await new Promise((resolve, reject) => {
-            exec(command, (error, stdout, stderr) => {
-                if (error) {
-                    console.error(`pdf to images error: ${error.message}`);
-                    reject(error);
-                } else {
-                    resolve(stdout);
-                }
-            });
-        });
+        logger.info(`[PdfParser] Extracting images from PDF: ${path.basename(this.filename)}`);
+        logger.info(`[PdfParser] Command: ${command}`);
 
-        let imageList = pub.readdir(imageTmpPath)
+        // 使用exec执行命令防止主进程阻塞，同时等待命令执行完成，以便获取输出
+        try {
+            await new Promise((resolve, reject) => {
+                exec(command, (error, stdout, stderr) => {
+                    if (error) {
+                        logger.error(`[PdfParser] pdfimages error: ${error.message}`);
+                        if (stderr) logger.error(`[PdfParser] stderr: ${stderr}`);
+                        reject(error);
+                    } else {
+                        resolve(stdout);
+                    }
+                });
+            });
+        } catch (cmdError) {
+            logger.error(`[PdfParser] Failed to extract images:`, cmdError);
+            return '';
+        }
+
+        let imageList = pub.readdir(imageTmpPath);
+
+        if (!imageList || imageList.length === 0) {
+            logger.warn(`[PdfParser] No images extracted: ${path.basename(this.filename)}`);
+            return '';
+        }
+        logger.info(`[PdfParser] Extracted ${imageList.length} images, starting OCR...`);
 
         // 初始化 Tesseract worker
         let worker = await initializeWorker();
-        
-        for(let imageFile of imageList) {
-            try{
+
+        for (let imageFile of imageList) {
+            try {
                 const { data } = await worker.recognize(imageFile);
                 // 对识别结果进行后处理
                 let cleanText = postProcessText(data.text);
-            
+
                 // 过滤低置信度行
                 const lines = data.blocks || [];
                 const filteredText = filterLowConfidenceLines(lines, CONFIDENCE_THRESHOLD);
-            
+
                 // 如果过滤后的文本有内容，则使用它
                 if (filteredText.trim().length > 0) {
                     cleanText = filteredText;
                 }
 
                 result += cleanText + "\n";
-            }catch (error) {
+            } catch (error) {
                 logError('解析图片失败', error);
             }
         }
@@ -304,7 +322,7 @@ export class PdfParser {
         await worker.terminate();
 
         // 删除临时文件
-        if(pub.file_exists(imageTmpPath)) {
+        if (pub.file_exists(imageTmpPath)) {
             pub.rmdir(imageTmpPath);
         }
         return result;

@@ -167,7 +167,7 @@ yarn debug-electron   # 调试 electron
 ```bash
 yarn build            # 构建所有组件
 yarn build-frontend   # 仅构建前端
-yarn build-electron   # 仅构建 electron
+yarn build electron   # 仅构建 electron
 yarn build-go-w/m/l   # 构建 Go 应用（Windows/Mac/Linux）
 yarn build-python     # 构建 Python 后端
 
